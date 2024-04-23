@@ -227,8 +227,8 @@ void StraightLineDistance::_init() {
     }
     *grid_mid_ptr = std::numeric_limits<double>::infinity();
     ++grid_mid_ptr;
-    CLASSIFIM_ASSERT(std::span<double>::iterator(grid_mid_ptr)
-        == cur_grid_mid_span.end());
+    // std::span<double>::iterator(grid_mid_ptr) does not compile on MacOS.
+    CLASSIFIM_ASSERT(grid_mid_ptr == &*cur_grid_mid_span.end());
   }
   assert(grid_mid_ptr == _grid_mid_data.get() + grid_mid_size);
 

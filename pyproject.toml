@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "classifim"
-version = "0.4.1.dev0"
+version = "0.4.1.dev2"
 description = "A Python package with ClassiFIM method and FIM-estimation task."
 authors = [{name = "Victor Kasatkin", email = "2148587+fiktor@users.noreply.github.com"}]
 license = {file = "LICENSE"}

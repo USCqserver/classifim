@@ -32,6 +32,14 @@ option(BUILD_SHARED_LIBS "Build shared libraries" ON)
 
 if(BUILD_SHARED_LIBS)
   add_subdirectory(src/classifim/cpp_src)
+  # If ${SKBUILD_PLATLIB_DIR} is defined, we need to install the shared library
+  # (compiled in src/classifim/cpp_src) to that directory:
+  if(DEFINED SKBUILD_PLATLIB_DIR)
+    install(TARGETS classifim
+      LIBRARY DESTINATION ${SKBUILD_PLATLIB_DIR}/classifim/lib
+      RUNTIME DESTINATION ${SKBUILD_PLATLIB_DIR}/classifim/lib
+    )
+  endif()
 endif()
 
 if(BUILD_TESTS)

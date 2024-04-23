@@ -70,7 +70,7 @@ def compute_2d_fim(
         "lambda0": [],
         "lambda1": [],
         "dir": [],
-        "chi_fc": []}
+        "fim": []}
     if verbose:
         pbar = tqdm(total=4 * resolution**2)
     for direction, v in FIDELITY_DIRECTIONS_2D.items():
@@ -228,7 +228,15 @@ def meshgrid_transform_2D_fim(
         grid, hence the size is smaller: resolution - 1 instead of resolution.
     """
     fim_df = as_data_frame(fim_df, decode=True)
+    dir_keys = ["+", "-", "0", "1"]
+    actual_dir_keys = np.unique(fim_df["dir"])
+    assert np.array_equal(
+        actual_dir_keys, np.unique(dir_keys)), (
+        f"fim_df['dir'] values are {actual_dir_keys}, expected {dir_keys}")
     resolution = len(np.unique(fim_df["lambda1"][fim_df["dir"] == "0"]))
+    lambda_origin = np.array([
+        np.min(fim_df["lambda0"][fim_df["dir"] == "1"]),
+        np.min(fim_df["lambda1"][fim_df["dir"] == "0"])])
     if verbose:
         print(f"{resolution=}")
     if scaling_resolution is None:
@@ -236,7 +244,6 @@ def meshgrid_transform_2D_fim(
     assert fim_df.shape[0] == (resolution - 1) * (4 * resolution - 2), (
         f"{fim_df.shape[0]} != {resolution - 1} * {4 * resolution - 2}.")
     dir_dict_df = dict(iter(fim_df.groupby("dir")))
-    dir_keys = ["+", "-", "0", "1"]
     assert list(dir_dict_df.keys()) == dir_keys
     # shifts[i][j] is 0 if lambda[i] corresponds to the nodes of the original
     # grid in dir_dict_df[j], and 1 if lambda[i] corresponds to the mid-points.
@@ -251,14 +258,15 @@ def meshgrid_transform_2D_fim(
         lambdas_ints = []
         for i in range(2):
             cur_half_ints = (
-                df[lambda_colnames[i]].to_numpy() * scaling_resolution
+                (df[lambda_colnames[i]].to_numpy() - lambda_origin[i]) * scaling_resolution
                 + 0.5 * (1 - shifts[i][dir_idx]))
             cur_ints = cur_half_ints.astype(int) # n + 0.5 -> n
             max_err = np.max(np.abs(cur_half_ints - cur_ints - 0.5))
             assert max_err < 1e-6, (
                 f"max_err = {max_err} >= 1e-6. "
                 f"cur_dir = {key}, {i=}, "
-                f"{cur_half_ints=}")
+                f"{cur_half_ints=}, "
+                f"{scaling_resolution=}, {resolution=}")
             lambdas_ints.append(cur_ints)
 
         df_index = lambdas_ints[1] * resolutions[0][dir_idx] + lambdas_ints[0]
@@ -282,7 +290,7 @@ def meshgrid_transform_2D_fim(
     res["fim_err1"] = np.maximum(-min_eigenvalue, 0)
     res["fim_00"] += res["fim_err1"]
     res["fim_11"] += res["fim_err1"]
-    res["lambda1"] = (np.arange(resolution - 1) + 0.5) / scaling_resolution
-    res["lambda0"] = res["lambda1"]
+    res["lambda1"] = lambda_origin[1] + (np.arange(resolution - 1) + 0.5) / scaling_resolution
+    res["lambda0"] = lambda_origin[0] + (np.arange(resolution - 1) + 0.5) / scaling_resolution
     return res
 

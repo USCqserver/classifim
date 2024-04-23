@@ -1,4 +1,4 @@
-import classifim_utils
+import classifim.utils
 import numpy as np
 import os.path
 import pandas as pd
@@ -7,7 +7,8 @@ import torch.nn as nn
 import torch.optim as optim
 import classifim.pipeline
 from classifim.data_loading import enumerate_distinct_rows
-from classifim_utils import load_tensor
+from classifim.utils import load_tensor
+from classifim.io import flatten_dict_for_npz
 
 class MnistZsTransform:
     def __init__(self):
@@ -370,47 +371,3 @@ def load_mnist_data(config, verbose=True):
         + f"!= ({num_mnist_rows}, 1, 28, 28)")
     return npz_dataset, mnist_inputs, mnist_labels
 
-def flatten_dict_for_npz(
-        d, key_prefix="", sep=".", permissive=False, target=None):
-    """
-    Flattens a nested dictionary to prepare for saving to npz file.
-
-    Args:
-        d: dictionary to flatten.
-        key_prefix: prefix to prepend to all keys. Should include trailing
-            separator if desired.
-        sep: separator to use between keys.
-        permissive: if True, ignore object imperfect for npz format.
-        target: target dictionary to write to. If None, a new dictionary is
-            created.
-    """
-    res = target if target is not None else {}
-    if not permissive:
-        assert isinstance(key_prefix, str), (
-            f"key_prefix must be a string, got {type(key_prefix)}")
-        assert isinstance(sep, str), (
-            f"sep must be a string, got {type(sep)}")
-    for k, v in d.items():
-        new_key = key_prefix + k
-        if isinstance(v, dict):
-            flatten_dict_for_npz(v, new_key + sep, sep, res)
-        else:
-            if isinstance(v, set):
-                v = list(v)
-            assert new_key not in res, (
-                f"Key {new_key} already exists in res.")
-            try:
-                v_np = np.array(v)
-            except Exception:
-                if not permissive:
-                    raise
-                v_np = None
-            if not permissive:
-                assert v_np.dtype != object, (
-                    f"Key {new_key} has dtype object, which is not supported "
-                    + "by npz format (without pickle).")
-            if v_np is not None and v_np.dtype != object:
-                res[new_key] = v_np
-            else:
-                res[new_key] = v
-    return res

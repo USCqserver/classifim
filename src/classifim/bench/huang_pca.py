@@ -1,5 +1,5 @@
 import classifim.utils
-import classifim.input
+import classifim.io
 import numba
 import numpy as np
 import os
@@ -137,7 +137,7 @@ class ComputeKShadowMatrixPipeline:
             npz_dataset = dict(f)
 
         prng = classifim.utils.DeterministicPrng(self.suffix)
-        dataset_train, dataset_test = classifim.input.split_train_test(
+        dataset_train, dataset_test = classifim.io.split_train_test(
             npz_dataset, test_size=0.1,
             seed=prng.get_seed("test"),
             scalar_keys=self.scalar_keys)

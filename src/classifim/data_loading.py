@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from classifim_utils import packbits
+from classifim.utils import packbits
 
 class TwelveSitesDataLoader():
     def __init__(self, data, batch_size):

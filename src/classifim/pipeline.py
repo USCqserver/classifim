@@ -1,5 +1,5 @@
-import classifim.input
-import classifim_utils
+import classifim.io
+import classifim.utils
 import datetime
 import numpy as np
 import pandas as pd
@@ -27,7 +27,7 @@ class Pipeline:
             dataset = np.load(self.config["dataset_filename"])
         self.dataset = dataset
         if prng is None:
-            prng = classifim_utils.DeterministicPrng(self.config["suffix"])
+            prng = classifim.utils.DeterministicPrng(self.config["suffix"])
         self.prng = prng
         self.split_dataset()
 
@@ -73,13 +73,13 @@ class Pipeline:
         Split the dataset into train and test.
         """
         test_fraction = self.config.get("test_fraction", 0.1)
-        dataset_train, dataset_test = classifim.input.split_train_test(
+        dataset_train, dataset_test = classifim.io.split_train_test(
             self.dataset,
             test_size=test_fraction,
             seed=self.prng.get_seed("split_test"),
             scalar_keys=self.config["scalar_keys"])
         if self.config["hold_out_test"]:
-            dataset_train, dataset_test = classifim.input.split_train_test(
+            dataset_train, dataset_test = classifim.io.split_train_test(
                 dataset_train,
                 test_size=self.config.get("val_fraction", test_fraction),
                 seed=self.prng.get_seed("split_val"),

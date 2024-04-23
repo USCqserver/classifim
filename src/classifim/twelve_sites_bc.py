@@ -1,7 +1,7 @@
 import classifim.layers
 import classifim.pipeline
 import classifim.w
-import classifim_utils
+import classifim.utils
 import datetime
 import numpy as np
 import sys
@@ -144,7 +144,7 @@ class BCPipeline(classifim.pipeline.Pipeline):
         Z_{Bj} of zs_out is zs_out[..., 0, j].
         Z_{Tj} of zs_out is zs_out[..., 1, j].
         """
-        zs_bin = classifim_utils.unpackbits(zs, 2 * self.n_sites)
+        zs_bin = classifim.utils.unpackbits(zs, 2 * self.n_sites)
         zs_bin = (1 - 2 * zs_bin).reshape(*zs.shape, 2, self.n_sites)
         return zs_bin.astype(np.float32)
 

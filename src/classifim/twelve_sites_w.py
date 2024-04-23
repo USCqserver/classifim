@@ -1,7 +1,7 @@
 import classifim.layers
 import classifim.pipeline
 import classifim.twelve_sites_bc
-import classifim_utils
+import classifim.utils
 import datetime
 import numpy as np
 import sys

@@ -1,5 +1,6 @@
 import hashlib
 import numpy as np
+import sys
 
 def fil24_unpack_zs(zs):
     """
@@ -14,7 +15,7 @@ def fil24_unpack_zs(zs):
     Z_{Tj} of zs_out is zs_out[..., 1, j].
     """
     # TODO:9: remove in favor of classifim.twelve_sites_pipeline.Pipeline.unpack_zs
-    zs_bin = classifim.input.unpackbits(zs, 24)
+    zs_bin = classifim.io.unpackbits(zs, 24)
     return (1 - 2 * zs_bin).reshape(*zs.shape, 2, 12).astype(np.float32)
 
 def split_train_test(dataset, test_size=0.1, seed=0, scalar_keys=()):
@@ -171,3 +172,174 @@ def get_classifim_train_dataset(dataset, num_passes=1, seed=0):
             f"{key} {value.shape} {num_output_samples}")
         # res[key] = value[i_shuffle]
     return res
+
+def flatten_dict_for_npz(
+        d, key_prefix="", sep=".", permissive=False, target=None):
+    """
+    Flattens a nested dictionary to prepare for saving to npz file.
+
+    Args:
+        d: dictionary to flatten.
+        key_prefix: prefix to prepend to all keys. Should include trailing
+            separator if desired.
+        sep: separator to use between keys.
+        permissive: if True, ignore object imperfect for npz format.
+        target: target dictionary to write to. If None, a new dictionary is
+            created.
+    """
+    res = target if target is not None else {}
+    if not permissive:
+        assert isinstance(key_prefix, str), (
+            f"key_prefix must be a string, got {type(key_prefix)}")
+        assert isinstance(sep, str), (
+            f"sep must be a string, got {type(sep)}")
+    for k, v in d.items():
+        new_key = key_prefix + k
+        if isinstance(v, dict):
+            flatten_dict_for_npz(v, new_key + sep, sep, target=res)
+        else:
+            if isinstance(v, set):
+                v = list(v)
+            assert new_key not in res, (
+                f"Key {new_key} already exists in res.")
+            try:
+                v_np = np.array(v)
+            except Exception:
+                if not permissive:
+                    raise
+                v_np = None
+            if not permissive:
+                assert v_np.dtype != object, (
+                    f"Key {new_key} has dtype object, which is not supported "
+                    + "by npz format (without pickle).")
+            if v_np is not None and v_np.dtype != object:
+                res[new_key] = v_np
+            else:
+                res[new_key] = v
+    return res
+
+def unflatten_dict_from_npz(d, sep="."):
+    """
+    Unflattens a dictionary that was saved to an npz file.
+
+    Args:
+        d: flattened dictionary.
+        sep: separator used between keys.
+
+    Returns:
+        unflattened dictionary.
+    """
+    res = {}
+    for k, v in d.items():
+        keys = k.split(sep)
+        cur = res
+        for key in keys[:-1]:
+            if key not in cur:
+                cur[key] = {}
+            cur = cur[key]
+        key = keys[-1]
+        assert key not in cur, f"Duplicate key '{k}'(?)"
+        cur[key] = v
+    return res
+
+def samples2d_to_bytes(samples, width):
+    """
+    Convert (n_samples, height, width) array of bits stored as
+    2D array `samples` of shape `(num_samples, height)` and dtype `np.uint64`
+    to a 2D np.ndarray of bytes.
+
+    Each sample is a bit array of shape `(height, width)`.
+
+    Args:
+        samples: numpy array of shape (n_samples, height) of dtype np.uint64.
+        width: width of the grid.
+
+    Returns:
+        np.ndarray `output_bytes` of shape `(num_samples, )`
+        and dtype `np.dtype(np.bytes_, ceil(width * height / 8))`.
+        bit #l of `output_bytes[i]`, i.e.
+        `output_bytes[i][l_high] >> l_low & 1` (where `l = l_high * 8 + l_low`),
+        is set to `(samples[i, j] >> k) & 1` where
+        `l = j * width + k` when `l < width * height`, and to 0 otherwise.
+    """
+    assert 1 <= width <= 64
+    n_samples, height = samples.shape
+    assert 1 <= height
+    n_bits = width * height
+    n_words = (n_bits + 63) // 64
+    out_buf = np.zeros((n_samples, n_words), dtype=np.uint64)
+    bit_i = np.uint64(0)
+    word_i = 0
+    np_width = np.uint64(width)
+    np_64 = np.uint64(64)
+    np_0 = np.uint64(0)
+    for j in range(height):
+        in_bits = samples[:, j]
+        out_buf[:, word_i] |= in_bits << bit_i
+        bit_i += np_width
+        if bit_i >= np_64:
+            bit_i -= np_64
+            word_i += 1
+            if bit_i > np_0:
+                out_buf[:, word_i] |= in_bits >> (np_width - bit_i)
+    n_bytes = (n_bits + 7) // 8
+    output_bytes = out_buf.view(np.uint8).reshape((n_samples, n_words * 8))[
+            :, :n_bytes]
+    output_bytes = np.frombuffer(
+        output_bytes.tobytes(),
+        dtype=np.dtype((np.bytes_, n_bytes)))
+    assert output_bytes.shape == (n_samples, )
+    return output_bytes
+
+def bytes_to_samples2d(in_bytes, height, width):
+    """
+    Convert a 2D np.ndarray of bytes back to an array of bits stored as
+    2D array of shape `(n_samples, height)` and dtype `np.uint64`.
+    This function implements the inverse of `samples2d_to_bytes`.
+
+    Args:
+        in_bytes: either
+            * np.ndarray of shape `(n_samples, ceil(width * height / 8))`
+                and dtype `np.uint8`, or
+            * np.ndarray of shape `(n_samples, )`
+                and dtype `np.dtype(np.bytes_, ceil(width * height / 8))`.
+        width: width of the grid (number of bits per row in the output).
+        height: number of rows in each sample.
+
+    Returns:
+        samples: numpy array of shape (n_samples, height) of dtype `np.uint64`.
+    """
+    if in_bytes.dtype.kind == "S":
+        n_samples, = in_bytes.shape
+        n_bytes = in_bytes.itemsize
+        in_bytes = np.frombuffer(in_bytes.tobytes(), dtype=np.uint8).reshape(
+            (n_samples, n_bytes))
+    else:
+        assert in_bytes.dtype == np.uint8
+        n_samples, n_bytes = in_bytes.shape
+    n_bits = width * height
+    assert n_bytes * 8 >= n_bits
+    n_words = (n_bits + 63) // 64
+
+    if n_bytes < n_words * 8:
+        in_bytes = np.pad(in_bytes, ((0, 0), (0, n_words * 8 - n_bytes)))
+    in_words = in_bytes.view(np.uint64)
+    assert in_words.shape == (n_samples, n_words)
+
+    samples = np.empty((n_samples, height), dtype=np.uint64)
+    bit_i = np.uint64(0)
+    word_i = 0
+    np_width = np.uint64(width)
+    np_64 = np.uint64(64)
+    np_0 = np.uint64(0)
+    width_mask = np.uint64((1 << width) - 1)
+    for j in range(height):
+        samples[:, j] = width_mask & (in_words[:, word_i] >> bit_i)
+        bit_i += np_width
+        if bit_i >= np_64:
+            bit_i -= np_64
+            word_i += 1
+            if bit_i > np_0:
+                samples[:, j] |= width_mask & (
+                        in_words[:, word_i] << (np_width - bit_i))
+    return samples

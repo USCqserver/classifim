@@ -3,7 +3,7 @@ Pipeline for data loading, training, and evaluation.
 """
 
 import classifim.data_loading
-import classifim.input
+import classifim.io
 import classifim.layers
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import classifim_utils
+import classifim.utils
 
 class Pipeline:
     """
@@ -60,7 +60,7 @@ class Pipeline:
         Z_{Bj} of zs_out is zs_out[..., 0, j].
         Z_{Tj} of zs_out is zs_out[..., 1, j].
         """
-        zs_bin = classifim_utils.unpackbits(zs, 2 * self.n_sites)
+        zs_bin = classifim.utils.unpackbits(zs, 2 * self.n_sites)
         zs_bin = (1 - 2 * zs_bin).reshape(*zs.shape, 2, self.n_sites)
         return zs_bin.astype(np.float32)
 
@@ -90,18 +90,18 @@ class Pipeline:
         self.seed = self.config.get("seed")
         if self.seed is None:
             self.seed = npz_dataset["seed"]
-        self.prng = classifim_utils.DeterministicPrng(self.seed)
+        self.prng = classifim.utils.DeterministicPrng(self.seed)
         if "n_sites" in npz_dataset:
             assert self.n_sites == npz_dataset["n_sites"]
 
-        self.dataset_train, self.dataset_test = classifim.input.split_train_test(
+        self.dataset_train, self.dataset_test = classifim.io.split_train_test(
             npz_dataset, test_size=self.config.get("test_fraction", 0.1),
             seed=self.prng.get_seed("test"),
             scalar_keys=self.config.get("scalar_keys", ["seed", "dataset_i"]))
         for dataset in (self.dataset_train, self.dataset_test):
-            classifim.input.scale_lambdas(
+            classifim.io.scale_lambdas(
                     dataset, inplace=True, dtype=np.float32)
-        self.dataset_bschifc_test = classifim.input.get_classifim_train_dataset(
+        self.dataset_bschifc_test = classifim.io.get_classifim_train_dataset(
             self.with_unpacked_zs(self.dataset_test),
             num_passes=self.config.get("test_num_passes", 100),
             seed=self.prng.get_seed("bitchifc_test"))
@@ -325,7 +325,7 @@ class Pipeline:
         assert zs_01.shape == (num_samples, self.n_sites, 2)
         zs_01 = zs_01.transpose((0, 2, 1)).reshape(
                 (num_samples, 2 * self.n_sites))
-        data["zs"] = classifim_utils.packbits(zs_01.astype(np.int32))
+        data["zs"] = classifim.utils.packbits(zs_01.astype(np.int32))
         return data
 
     def record_test_data(self, use_bench_format=False, dataloader=None):

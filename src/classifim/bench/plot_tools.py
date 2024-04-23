@@ -16,7 +16,13 @@ def as_data_frame(df, copy=False, decode=False, skip_scalars=False):
     """
     if isinstance(df, pd.DataFrame):
         if copy:
-            return df.copy()
+            df = df.copy()
+        if decode:
+            for key, value in df.items():
+                if (value.dtype.kind == 'S'
+                        or (value.dtype == np.dtype('O')
+                            and isinstance(value[0], bytes))):
+                    df[key] = [x.decode("utf-8") for x in value]
         return df
     df_type = type(df)
     type_check = isinstance(df, dict) or isinstance(df, np.lib.npyio.NpzFile)

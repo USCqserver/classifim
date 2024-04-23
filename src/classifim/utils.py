@@ -4,9 +4,7 @@ import os
 import os.path
 import torch
 
-from classifim_utils.downloader import Downloader
-
-def find_data_dir(code_dir=None):
+def find_data_dir(config_name="data_dir", code_dir=None):
     """
     Find the directory with datasets.
 
@@ -22,7 +20,7 @@ def find_data_dir(code_dir=None):
             config = toml.load(CONFIG_TOML_PATH)
             if "main" in config:
                 config = config["main"]
-            data_dir = config["data_dir"]
+            data_dir = config[config_name]
             data_dir = os.path.realpath(os.path.expanduser(data_dir))
             if os.path.isdir(data_dir):
                 return data_dir
