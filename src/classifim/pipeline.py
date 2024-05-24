@@ -9,27 +9,10 @@ import torch.optim as optim
 
 from sklearn.preprocessing import MinMaxScaler
 
-class Pipeline:
+class Preprocessor:
     """
-    Pipeline for training and using ClassiFIM BC neural network.
+    Transform dataset in-place.
     """
-    def __init__(self, config, dataset=None, prng=None):
-        """
-        Initialize the pipeline.
-
-        Args:
-            config: Config object.
-            dataset: dict with the dataset to be split into train and test.
-            prng: Deterministic pseudo-random number generator.
-        """
-        self.config = config
-        if dataset is None:
-            dataset = np.load(self.config["dataset_filename"])
-        self.dataset = dataset
-        if prng is None:
-            prng = classifim.utils.DeterministicPrng(self.config["suffix"])
-        self.prng = prng
-        self.split_dataset()
 
     def fit_transform_lambdas(self, dataset):
         """
@@ -68,24 +51,67 @@ class Pipeline:
         """
         self.transform_lambdas(dataset)
 
+class Pipeline:
+    """
+    Pipeline for training and using ClassiFIM BC neural network.
+    """
+    def __init__(
+            self, config, dataset=None, prng=None, preprocessor=None,
+            d_train=None):
+        """
+        Initialize the pipeline.
+
+        Args:
+            config: Config object.
+            dataset: dict with the dataset to be split into train and test.
+            prng: Deterministic pseudo-random number generator.
+        """
+        self.preprocessor = preprocessor or Preprocessor()
+        self.config = config
+        if d_train is not None:
+            self.dataset_train = d_train
+            if dataset is not None:
+                raise ValueError("d_train and dataset cannot be both set")
+        elif dataset is None:
+            dataset = np.load(self.config["dataset_filename"])
+        self.dataset = dataset
+        if prng is None:
+            seed = self.config.get("seed", None)
+            if seed is None:
+                seed = (dataset or d_train).get("seed", None)
+            if seed is None:
+                seed = self.config["suffix"]
+            prng = classifim.utils.DeterministicPrng(seed)
+        self.prng = prng
+        self.split_dataset()
+
+
     def split_dataset(self):
         """
         Split the dataset into train and test.
         """
         test_fraction = self.config.get("test_fraction", 0.1)
-        dataset_train, dataset_test = classifim.io.split_train_test(
-            self.dataset,
-            test_size=test_fraction,
-            seed=self.prng.get_seed("split_test"),
-            scalar_keys=self.config["scalar_keys"])
+        if self.dataset is None:
+            dataset_train = self.dataset_train
+            try:
+                dataset_test = self.dataset_test
+            except AttributeError:
+                dataset_test = None
+        else:
+            dataset_train, dataset_test = classifim.io.split_train_test(
+                self.dataset,
+                test_size=test_fraction,
+                seed=self.prng.get_seed("split_test"),
+                scalar_keys=self.config["scalar_keys"])
         if self.config["hold_out_test"]:
             dataset_train, dataset_test = classifim.io.split_train_test(
                 dataset_train,
                 test_size=self.config.get("val_fraction", test_fraction),
                 seed=self.prng.get_seed("split_val"),
                 scalar_keys=self.config["scalar_keys"])
-        self.fit_transform(dataset_train)
-        self.transform(dataset_test)
+        self.preprocessor.fit_transform(dataset_train)
+        if dataset_test is not None:
+            self.preprocessor.transform(dataset_test)
         self.dataset_train = dataset_train
         self.dataset_test = dataset_test
 
@@ -106,7 +132,7 @@ class Pipeline:
         return self._get_data_loader(
             self.dataset_train, is_train=True, device=device)
 
-    def get_test_loader(self, batch_size=None, device=None):
+    def get_test_loader(self, dataset=None, batch_size=None, device=None):
         """
         Construct a DataLoader for the test set.
 
@@ -116,8 +142,9 @@ class Pipeline:
         for efficiency reasons. The method should be implemented in
         derived classes.
         """
+        dataset = dataset or self.dataset_test
         return self._get_data_loader(
-            self.dataset_train, batch_size=batch_size, is_train=False,
+            dataset, batch_size=batch_size, is_train=False,
             device=device)
 
     def get_fim_loader(self, dataset, batch_size=None, device=None):
@@ -149,14 +176,17 @@ class Pipeline:
             self.model.parameters(), lr=max_lr/2,
             weight_decay=self.config.get("weight_decay", 1e-4))
         pct_start = self.config.get("one_cycle_lr.pct_start", 0.1)
+        lr_epochs = self.config.get(
+                "one_cycle_lr.num_epochs", self.config["num_epochs"])
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer, max_lr=max_lr, pct_start=pct_start,
-            epochs=self.config["num_epochs"], steps_per_epoch=1)
+            epochs=lr_epochs, steps_per_epoch=1)
 
-    def construct_model(self, device=None, cls=None):
+    def construct_model(self, device=None, cls=None, model_init_kwargs=None):
         if cls is None:
             raise NotImplementedError
-        model_init_kwargs = self.config.get("model_init_kwargs", {})
+        if model_init_kwargs is None:
+            model_init_kwargs = self.config.get("model_init_kwargs", {})
         model = cls(**model_init_kwargs)
         if device is not None:
             model = model.to(device)
@@ -172,9 +202,18 @@ class Pipeline:
         Keeps self.model, self.loss_fn.
         Returns: None
         """
-        del self.optimizer
-        del self.scheduler
-        del self.train_loader
+        try:
+            del self.optimizer
+        except AttributeError:
+            pass
+        try:
+            del self.scheduler
+        except AttributeError:
+            pass
+        try:
+            del self.train_loader
+        except AttributeError:
+            pass
 
     def train(self):
         """
@@ -246,11 +285,18 @@ class Pipeline:
             print()
         return res
 
-    def test(self, num_epochs=None, batch_size=2**14, device="cuda:0"):
+    def test(self, d_test=None, do_transform=True, num_epochs=None,
+            batch_size=2**14, device="cuda:0"):
         if num_epochs is None:
             num_epochs = self.config["num_epochs"]
+        if d_test is None:
+            dataset = self.dataset_test
+        else:
+            dataset = d_test
+            if do_transform:
+                self.preprocessor.transform(dataset)
         torch.manual_seed(self.prng.get_int_seed("test_model"))
-        test_loader = self.get_test_loader()
+        test_loader = self.get_test_loader(dataset=dataset)
         self.test_res = self.test_nn(
             test_loader, self.model, self.loss_fn,
             num_epochs=num_epochs,
@@ -308,12 +354,14 @@ class Pipeline:
         """
         Args:
             dataset: dict with the following keys:
-            - lambdas: numpy array of shape (num_samples, 2) on [-1, 1] scale.
+            - scaled_lambdas: numpy array of shape (num_samples, 2)
+                on [-1, 1] scale.
             - zs: numpy array of shape (num_samples, 2, n_sites).
 
         Returns:
             lambdas: numpy array of shape (num_samples, 2).
-                (same as dataset['lambdas'] but scaled to [0, 1) instead of [-1, 1)).
+                (same as dataset['lambdas'] but scaled to original scale,
+                usually [0, 1) instead of [-1, 1)).
             output1: numpy array of shape (num_samples, 2). Output of the model
                 used to estimate fidelity susceptibility.
         """
@@ -335,8 +383,8 @@ class Pipeline:
             output1_all[lambda_range] = output1.cpu().numpy()
         assert actual_num_samples == num_samples
 
-        # Scale lambdas from [-1, 1] back to [0, 1]
-        return ((lambdas_np + 1) / 2, output1_all)
+        lambdas = self.preprocessor.lambda_scaler.inverse_transform(lambdas_np)
+        return (lambdas, output1_all)
 
     def eval_fim(self):
         lambdas, output1 = self.eval_fim_estimate(
@@ -358,9 +406,11 @@ class Pipeline:
             df[lambda_name] = lambdas[:, i]
             lambda_names.append(lambda_name)
 
+        scale = self.preprocessor.lambda_scaler.scale_
         for i in range(output1.shape[1]):
             for j in range(i, output1.shape[1]):
-                df[f"fim_{i}{j}"] = 4 * output1[:, i] * output1[:, j]
+                scale_ij = scale[i] * scale[j]
+                df[f"fim_{i}{j}"] = scale_ij * output1[:, i] * output1[:, j]
 
         df = pd.DataFrame(df)
         non_lambda_columns = [
@@ -422,4 +472,3 @@ class Pipeline:
                 return tuple(output)
             else:
                 return output[0]
-

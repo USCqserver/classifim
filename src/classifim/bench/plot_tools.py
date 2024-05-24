@@ -3,6 +3,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import pandas as pd
 import re
+import scipy.signal
 
 def as_data_frame(df, copy=False, decode=False, skip_scalars=False):
     """
@@ -250,8 +251,8 @@ def _plot_fim_df_1d_ml(ax, fixed_lambda_index, fixed_lambda_val, ml_fim_df,
     lambda1s, f11s = (
             ml_fim_df[key][ii1]
             for key in (x_lambda_colname, fim_dir_colname))
-    default_style = dict(linestyle='-', color='black', marker='.',
-                         linewidth=0.5, markersize=2.0)
+    default_style = dict(linestyle='-', color='blue', marker='.',
+                         linewidth=1.0, markersize=2.0)
     ax.plot(lambda1s, f11s, **{**default_style, **kwargs})
     return lambda1s, f11s
 
@@ -284,18 +285,43 @@ def convert_df_chifc_to_fim(df, ensure_columns=None):
             if col not in columns:
                 raise ValueError(f"Missing column {col} (not in {columns})")
 
+def grid_point_to_human_str(
+        v, grid, resolution=None, lookup_tolerance=2**(-23)):
+    """
+    Converts a grid point (e.g. 27 / 64) to a human-readable string
+    (e.g. "27 / 64").
+    """
+    if resolution is None:
+        resolution = int(0.5 + (len(grid) - 1) / (grid[-1] - grid[0]))
+    # Below we use 'num' for 'numerator' (denominator is `resolution`).
+    num_start = int(0.5 + grid[0] * resolution)
+    expected_grid = (num_start + np.arange(len(grid), dtype=grid.dtype)
+            ) / resolution
+    use_float = False
+    if not np.allclose(grid, expected_grid, atol=lookup_tolerance):
+        use_float = True
+    num_v = int(0.5 + v * resolution)
+    if abs(v - num_v / resolution) > lookup_tolerance:
+        use_float = True
+    if use_float:
+        return f"{v:.3f}"
+    return f"{num_v} / {resolution}"
+
 def plot_fim_df_1d(
         fim_df=None,
         ml_fim_dfs=None,
-        hamiltonian_name=None,
+        sm_name=None,
+        ax=None,
         fixed_lambda=(0, 25),
-        resolution=64,
+        resolution=None,
         lookup_tolerance=2**(-23),
         file_name=None,
+        fim_vlines=None,
         ymax=150,
         figsize=(12, 5),
         verbose=2,
         gt_label="Ground truth",
+        ml_kwargs=None,
         savefig_kwargs=None):
     """
     Plot the fidelity susceptibility along a line in parameter space.
@@ -305,8 +331,16 @@ def plot_fim_df_1d(
     Args:
         fim_df: DataFrame describing the reference FIM.
         ml_fim_dfs: list of DataFrames describing the FIMs for the ML models.
+        sm_name: name of the statistical manifold.
+        fim_vlines: one of the following:
+            - None or False: do not plot vertical lines.
+            - True: extract peaks from fim_df and plot vertical lines.
+            - a list of sweep_lambda values to plot vertical lines at.
+        ax: matplotlib axis to plot on (if None, a new figure is created).
+        ml_kwargs: keyword arguments for the plot of the ML models.
     """
 
+    res = {}
     fixed_lambda_index, fixed_lambda_int_val = fixed_lambda
     fixed_lambda_colname = "lambda" + str(fixed_lambda_index)
     x_lambda_index = 1 - fixed_lambda_index
@@ -337,21 +371,25 @@ def plot_fim_df_1d(
                 f"{fixed_lambda_val} != {v1} "
                 + f"== {fixed_lambda_vals[fixed_lambda_int_val]}")
 
-    fig, ax = plt.subplots(figsize=figsize)
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.get_figure()
 
-    hamiltonian_str = f" for {hamiltonian_name}" if hamiltonian_name else ""
-    assert (np.abs(fixed_lambda_val - fixed_lambda_int_val / resolution)
-            < lookup_tolerance)
+    sm_str = f" for {sm_name}" if sm_name else ""
+    fixed_lambda_str = grid_point_to_human_str(
+        fixed_lambda_val, fixed_lambda_vals, resolution=resolution,
+        lookup_tolerance=lookup_tolerance)
     ax.set_title("FIM comparison"
-                 + f"{hamiltonian_str} at $\\lambda_{fixed_lambda_index} "
-                 + f"= {int(fixed_lambda_int_val)} / {resolution}$")
+                 + f"{sm_str} at $\\lambda_{fixed_lambda_index} "
+                 + f"= {fixed_lambda_str}$")
     ax.set_xlabel("$\lambda_" + f"{x_lambda_index}$")
     ax.set_ylabel("$g_{" + str(x_lambda_index) * 2 + "}$")
 
     ax.set_xlim((1.5 * x_lambda_vals[0] - 0.5 * x_lambda_vals[1],
                  1.5 * x_lambda_vals[-1] - 0.5 * x_lambda_vals[-2]))
-    if ymax is not None:
-        ax.set_ylim((0, ymax))
+    # Note: if ymax is None, this only sets the lower limit:
+    ax.set_ylim((0, ymax))
     if fim_df is not None:
         ii0 = np.arange(fim_df.shape[0])[
                 fim_df[fixed_lambda_colname] == fixed_lambda_val]
@@ -359,18 +397,45 @@ def plot_fim_df_1d(
         convert_df_chifc_to_fim(fim_df, ensure_columns=["fim"])
         fim0 = fim_df["fim"].iloc[ii0]
         ax.plot(x0_lambdas, fim0,
-                linewidth=2.0, color='blue', linestyle='-',
+                linewidth=1.0, color='black', linestyle='--',
                 label=gt_label, marker='.', markersize=1.0)
+    if fim_vlines:
+        if isinstance(fim_vlines, bool):
+            if fim_df is None:
+                raise ValueError("fim_df must be provided to plot vertical lines.")
+            fim_slice = fim_df.iloc[ii0]
+            vline_ids = scipy.signal.find_peaks(fim_slice["fim"], prominence=20)[0]
+            fim_vlines = fim_slice[x_lambda_colname].iloc[vline_ids]
+        fim_vlines = np.asarray(fim_vlines)
+        res["fim_vlines"] = fim_vlines
+        for vline in fim_vlines:
+            ax.axvline(vline, color='black', linestyle=':', linewidth=1.0)
     ml_ys = []
     ml_fim_dfs = ml_fim_dfs or []
+    if isinstance(ml_kwargs, list):
+        assert len(ml_fim_dfs) == len(ml_kwargs), (
+            f"{len(ml_fim_dfs)} != {len(ml_kwargs)}")
     for i, ml_fim_df in enumerate(ml_fim_dfs):
         convert_df_chifc_to_fim(ml_fim_df, ensure_columns=["fim_00"])
-        ml_kwargs = {}
+        if isinstance(ml_kwargs, list):
+            cur_ml_kwargs = ml_kwargs[i].copy()
+        elif isinstance(ml_kwargs, dict):
+            cur_ml_kwargs = ml_kwargs.copy()
+        elif ml_kwargs is None:
+            cur_ml_kwargs = {}
+        else:
+            raise ValueError(
+                f"Invalid ml_kwargs: {ml_kwargs} (type {type(ml_kwargs)})")
         if i == 0:
-            ml_kwargs = {"label": "ClassiFIM"}
+            cur_ml_kwargs["label"] = cur_ml_kwargs.get("label", "ClassiFIM")
+        elif isinstance(ml_kwargs, dict):
+            try:
+                del cur_ml_kwargs["label"]
+            except KeyError:
+                pass
         xs, ys = _plot_fim_df_1d_ml(
                 ax, fixed_lambda_index, fixed_lambda_val, ml_fim_df,
-                lookup_tolerance=lookup_tolerance, **ml_kwargs)
+                lookup_tolerance=lookup_tolerance, **cur_ml_kwargs)
         ml_ys.append(ys)
         if i == 0:
             xs0 = xs
@@ -385,7 +450,7 @@ def plot_fim_df_1d(
 
     ax.legend()
 
-    if verbose >= 2:
+    if verbose >= 2 and len(ml_fim_dfs) >= 2:
         print("Grayed out regions are 2 standard deviations from the mean.")
 
     if file_name is not None:
@@ -394,6 +459,65 @@ def plot_fim_df_1d(
             fixed_lambda_int_val=fixed_lambda_int_val)
         savefig_kwargs = savefig_kwargs or {}
         fig.savefig(file_name, bbox_inches='tight', **savefig_kwargs)
+        res["file_name"] = file_name
         if verbose >= 1:
             print(f"Saved to '{file_name}'")
+    return res
 
+def plot_w2d(ax, npz, sweep_axis=0, colorbar=False, cbar_ax=None):
+    x, y, z = [
+        npz[key]
+        for key in ['lambda_sweep_thresholds', 'lambda_fixed', 'accuracy']]
+    if sweep_axis != 0:
+        assert sweep_axis == 1
+        x, y, z = y, x, z.T
+    pc = ax.pcolormesh(
+        x, y, z,
+        cmap=spiral_background2_cmap,
+        shading='nearest', vmin=0.75, vmax=1.0)
+    if colorbar:
+        fig = ax.get_figure()
+        if cbar_ax:
+            fig.colorbar(pc, cax=cbar_ax)
+        else:
+            fig.colorbar(pc)
+    return pc
+
+def plot_w1d(ax, npz, lambda_v):
+    x = npz['lambda_sweep_thresholds']
+    i = np.searchsorted(npz['lambda_fixed'], lambda_v)
+    if i + 1 < len(npz['lambda_fixed']):
+        v, vnext = npz['lambda_fixed'][i:i+2]
+        if abs(v - lambda_v) > abs(vnext - lambda_v):
+            i += 1
+    acc = npz['accuracy'][i]
+    acc_min = np.min(acc)
+    ax.plot(x, acc)
+    ax.set_xlim((0, 1))
+    ax.set_ylim((max(0.75, acc_min - 0.01), 1))
+
+def plot_pca(ax, pca):
+    n0, n1, num_components = pca.shape
+    assert n0 == 64
+    assert n1 == 64
+    assert num_components >= 3
+    lambda0s = np.arange(64) / 63
+    lambda1s = np.arange(64) / 63
+    pca3 = pca[:, :, :3]
+    z = pca3 - np.min(pca3, axis=(0, 1))
+    z = z / np.max(z, axis=(0, 1))
+    ax.pcolormesh(lambda0s, lambda1s, z.swapaxes(0, 1), shading="nearest")
+    ax.set_xlabel(r"$\lambda_0$")
+    ax.set_ylabel(r"$\lambda_1$")
+    ax.set_title("Phase diagram from PCA")
+
+def plot_gt_peaks_2d(ax, sweep_lambda_index, gt_peaks):
+    assert sweep_lambda_index in [0, 1]
+    xs = gt_peaks["lambda_sweep"]
+    ys = gt_peaks["lambda_fixed"]
+    if sweep_lambda_index == 1:
+        xs, ys = ys, xs
+    for is_inner in [True, False]:
+        ii = (gt_peaks["is_inner"] == is_inner)
+        ax.plot(
+            xs[ii], ys[ii], ('o' if is_inner else 's'), mfc='none', mec='black')

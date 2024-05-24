@@ -13,6 +13,23 @@ import torch.nn as nn
 import torch.optim as optim
 import classifim.utils
 
+def unpack_zs(zs, n_sites):
+    """
+    Converts an array of (2 * self.n_sites)-bit integers into an array of Z
+        values in {-1, 1}.
+
+    Input format: 0bTT...TTBB...BB
+    Bit Bj of zs is (zs & (1 << j)) > 0.
+    Bit Tj of zs is (zs & (1 << (self.nsites + j))) > 0.
+
+    Output format: [[Z_{B0}, Z_{B1}, ..., Z_{B11}], [Z_{T0}, ..., Z_{T11}]]
+    Z_{Bj} of zs_out is zs_out[..., 0, j].
+    Z_{Tj} of zs_out is zs_out[..., 1, j].
+    """
+    zs_bin = classifim.utils.unpackbits(zs, 2 * n_sites)
+    zs_bin = (1 - 2 * zs_bin).reshape(*zs.shape, 2, n_sites)
+    return zs_bin.astype(np.float32)
+
 class Pipeline:
     """
     Example usage:
@@ -48,21 +65,7 @@ class Pipeline:
         self.n_sites = self.config.get("n_sites", 12)
 
     def unpack_zs(self, zs):
-        """
-        Converts an array of (2 * self.n_sites)-bit integers into an array of Z
-            values in {-1, 1}.
-
-        Input format: 0bTT...TTBB...BB
-        Bit Bj of zs is (zs & (1 << j)) > 0.
-        Bit Tj of zs is (zs & (1 << (self.nsites + j))) > 0.
-
-        Output format: [[Z_{B0}, Z_{B1}, ..., Z_{B11}], [Z_{T0}, ..., Z_{T11}]]
-        Z_{Bj} of zs_out is zs_out[..., 0, j].
-        Z_{Tj} of zs_out is zs_out[..., 1, j].
-        """
-        zs_bin = classifim.utils.unpackbits(zs, 2 * self.n_sites)
-        zs_bin = (1 - 2 * zs_bin).reshape(*zs.shape, 2, self.n_sites)
-        return zs_bin.astype(np.float32)
+        return unpack_zs(zs, self.n_sites)
 
     def with_unpacked_zs(self, dataset):
         """

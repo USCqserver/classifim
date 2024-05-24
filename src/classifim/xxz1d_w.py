@@ -15,8 +15,7 @@ class WDataLoader(classifim.w.DataLoader):
     def _init_zs(self, data, device, idx):
         zs = data["zs"][idx]
         assert len(zs.shape) == 2
-        self.zs = torch.from_numpy(zs).to(
-            device=device, dtype=torch.uint8)
+        self.zs = torch.from_numpy(zs).to(device=device, dtype=torch.uint8)
 
     def _retrieve_zs(self, idx):
         return (self.zs[idx], )

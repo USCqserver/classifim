@@ -73,34 +73,73 @@ class TwelveSitesNN2(nn.Module):
     for van Nieuwenburg's W, training a separate model for each
     value of lambda_fixed and lambda_sweep_critical.
     """
-    def __init__(self, n_sites=12, layer_bs=63, cnn_layer=BatchCnn12Sites):
+    def __init__(
+            self, n_sites=12, layer_bs=63, cnn_layer=BatchCnn12Sites,
+            zs_pool_version=None, cnn_version=None, fc_width=None):
         super(TwelveSitesNN2, self).__init__()
         self.n_sites = n_sites
         self.width_scale = (n_sites / 12)**0.5
         scale_width = lambda w: int(w * self.width_scale + 0.5)
 
-        self.zs_cnn = nn.Sequential(
-            cnn_layer(layer_bs, 2, 32),
-            nn.ReLU(),
-            cnn_layer(layer_bs, 32, 64),
-            nn.ReLU()
-        )
+        # Process zs
+        if cnn_version == 1:
+            self.zs_cnn = nn.Sequential(
+                cnn_layer(layer_bs, 2, 32),
+                nn.ReLU(),
+                cnn_layer(layer_bs, 32, 64),
+                nn.ReLU()
+            )
+            num_channels = 64
+        elif cnn_version == 2:
+            self.zs_cnn = nn.Sequential(
+                cnn_layer(layer_bs, 2, 24),
+                nn.ReLU(),
+                cnn_layer(layer_bs, 24, 32),
+                nn.ReLU()
+            )
+            num_channels = 32
+        elif cnn_version == 3:
+            self.zs_cnn = nn.Sequential(
+                cnn_layer(layer_bs, 2, 16),
+                nn.ReLU(),
+                cnn_layer(layer_bs, 16, 24),
+                nn.ReLU()
+            )
+            num_channels = 24
+        else:
+            raise ValueError(f"Unknown cnn_version: {cnn_version}")
 
+        if zs_pool_version == 1:
+            self.zs_pool = self.zs_pool_1x
+        elif zs_pool_version == 2:
+            self.zs_pool = self.zs_pool_2x
+            num_channels *= 2
+        else:
+            raise ValueError(f"Unknown zs_pool_version: {zs_pool_version}")
+
+        if fc_width is None:
+            fc_width = scale_width(64)
         self.fc = nn.Sequential(
-            classifim.w.BatchLinear(layer_bs, 64, scale_width(64)),
+            classifim.w.BatchLinear(layer_bs, num_channels, fc_width),
             nn.ReLU(),
-            classifim.w.BatchLinear(layer_bs, scale_width(64), scale_width(64)),
+            classifim.w.BatchLinear(layer_bs, fc_width, fc_width),
             nn.ReLU(),
-            classifim.w.BatchLinear(layer_bs, scale_width(64), 1)
+            classifim.w.BatchLinear(layer_bs, fc_width, 1)
         )
 
-    def zs_pool(self, x):
-        """Remove dimension -2 of x by applying AvgPool1d."""
-        x = x.transpose(-1, -2)
-        batch_size = x.shape[:-1]
-        x = F.adaptive_avg_pool1d(
-            x.view(-1, batch_size[-1], x.shape[-1]), 1)
-        return x.view(*batch_size)
+    def zs_pool_1x(self, x):
+        """
+        Remove dimension -2 of x by applying AvgPool1d.
+        """
+        return x.mean(dim=-2)
+
+    def zs_pool_2x(self, x):
+        """
+        Remove dimension -2 of x by applying AvgPool1d and MaxPool1d.
+
+        This doubles the number of features.
+        """
+        return torch.cat([x.mean(dim=-2), x.max(dim=-2)[0]], dim=-1)
 
     def forward(self, zs):
         """
@@ -131,19 +170,21 @@ class WDataLoader(classifim.w.DataLoader):
         zs = data["unpacked_zs"][idx].astype(np.float32)
         zs = zs.swapaxes(1, 2)[:, np.newaxis, :, :]
         n_sites = zs.shape[2]
-        assert zs.shape == (num_samples, 1, n_sites, 2)
+        assert zs.shape[1:] == (1, n_sites, 2)
         self.zs = torch.from_numpy(zs).to(device)
 
     def _retrieve_zs(self, idx):
         return (self.zs[idx], )
 
-class WPipeline(classifim.w.Pipeline, classifim.twelve_sites_bc.BCPipeline):
-    def _transform(self, dataset):
-        dataset["unpacked_zs"] = self.unpack_zs(dataset["zs"])
-        classifim.w.Pipeline._transform(self, dataset)
+class WPipeline(classifim.twelve_sites_bc.BCPipeline, classifim.w.Pipeline):
+    def __init__(self, config, *args, preprocessor=None, **kwargs):
+        preprocessor = preprocessor or classifim.twelve_sites_bc.WPreprocessor(
+            scalar_keys=config.get('scalar_keys', []),
+            sweep_lambda_index=config['sweep_lambda_index'],
+            n_sites=config['n_sites'])
+        super().__init__(config=config, preprocessor=preprocessor, **kwargs)
 
-    def _get_data_loader(
-            self, dataset, is_train, **kwargs):
+    def _get_data_loader(self, dataset, is_train, **kwargs):
         return classifim.w.Pipeline._get_data_loader(
             self, dataset, is_train, cls=WDataLoader, **kwargs)
 

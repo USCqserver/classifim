@@ -1,5 +1,6 @@
 import classifim.layers
 import classifim.pipeline
+import classifim.twelve_sites_pipeline
 import classifim.w
 import classifim.utils
 import datetime
@@ -14,7 +15,7 @@ class TwelveSitesNN2(nn.Module):
     for simple binary classification, not ClassiFIM.
     """
     def __init__(self, n_sites=12, cnn_layer=classifim.layers.Cnn12Sites):
-        super(TwelveSitesNN2, self).__init__()
+        super().__init__()
         self.n_sites = n_sites
         self.width_scale = (n_sites / 12)**0.5
         scale_width = lambda w: int(w * self.width_scale + 0.5)
@@ -126,37 +127,19 @@ class BCDataLoader:
         self.pos = i1
         return self._retrieve_samples(i0, i1)
 
-class BCPipeline(classifim.pipeline.Pipeline):
-    def __init__(self, config):
-        self.n_sites = config["n_sites"]
-        super().__init__(config)
-
-    def unpack_zs(self, zs):
-        """
-        Converts an array of (2 * self.n_sites)-bit integers into an array of Z
-            values in {-1, 1}.
-
-        Input format: 0bTT...TTBB...BB
-        Bit Bj of zs is (zs & (1 << j)) > 0.
-        Bit Tj of zs is (zs & (1 << (self.nsites + j))) > 0.
-
-        Output format: [[Z_{B0}, Z_{B1}, ..., Z_{B11}], [Z_{T0}, ..., Z_{T11}]]
-        Z_{Bj} of zs_out is zs_out[..., 0, j].
-        Z_{Tj} of zs_out is zs_out[..., 1, j].
-        """
-        zs_bin = classifim.utils.unpackbits(zs, 2 * self.n_sites)
-        zs_bin = (1 - 2 * zs_bin).reshape(*zs.shape, 2, self.n_sites)
-        return zs_bin.astype(np.float32)
+class WPreprocessor(classifim.w.WPreprocessor):
+    def __init__(self, n_sites, **kwargs):
+        super().__init__(**kwargs)
+        self.n_sites = n_sites
 
     def _transform(self, dataset):
-        dataset["unpacked_zs"] = self.unpack_zs(dataset["zs"])
-        sweep_lambda_index = self.config["sweep_lambda_index"]
-        dataset["sweep_lambda_index"] = sweep_lambda_index
-        label_lambdas = dataset["scaled_lambdas"][:, sweep_lambda_index]
+        super()._transform(dataset)
+        dataset["unpacked_zs"] = classifim.twelve_sites_pipeline.unpack_zs(
+            dataset["samples"], self.n_sites)
 
-        # 1.0 if label_lambdas > 0.5
-        # 0.0 if label_lambdas between -0.5 and 0.5
-        # -1.0 if label_lambdas < -0.5
+def BCPreprocessor(WPreprocessor):
+    def _transform(self, dataset):
+        super()._transform(dataset)
         dataset["labels"] = np.where(
             label_lambdas > 0.5,
             1.0,
@@ -165,16 +148,14 @@ class BCPipeline(classifim.pipeline.Pipeline):
                 -1.0,
                 0.0)).astype(np.float32)
 
-    def fit_transform(self, dataset):
-        """
-        Fits the scaling parameters to the dataset and transforms it.
-        """
-        self.fit_transform_lambdas(dataset)
-        self._transform(dataset)
-
-    def transform(self, dataset):
-        self.transform_lambdas(dataset)
-        self._transform(dataset)
+class BCPipeline(classifim.pipeline.Pipeline):
+    def __init__(self, config, *args, preprocessor=None, **kwargs):
+        preprocessor = preprocessor or BCPreprocessor(
+            scalar_keys=config.get('scalar_keys', []),
+            sweep_lambda_index=config['sweep_lambda_index'],
+            n_sites=config['n_sites'])
+        self.n_sites = config["n_sites"]
+        super().__init__(config=config, preprocessor=preprocessor, **kwargs)
 
     def _get_data_loader(self, dataset, is_train, batch_size=None, device=None):
         if device is None:
@@ -194,6 +175,6 @@ class BCPipeline(classifim.pipeline.Pipeline):
         self.model = model
 
     # train_nn is the same as in classifim.w.Pipeline:
-    train_nn = classifim.w.Pipeline.train_nn
-    test_nn = classifim.w.Pipeline.test_nn
+    train_nn = staticmethod(classifim.w.Pipeline.train_nn)
+    test_nn = staticmethod(classifim.w.Pipeline.test_nn)
 

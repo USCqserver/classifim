@@ -2,11 +2,16 @@
 Computing peak accuracy for comparison with prior work.
 """
 
-import classifim_gen.plot_tools
+import classifim.bench.plot_tools
 import functools
+import itertools
 import numpy as np
+import pandas as pd
 import scipy.signal
+import scipy.stats
 import sklearn.cluster
+import sys
+import warnings
 
 def rename_keys(d, key_map):
     """
@@ -20,9 +25,9 @@ def rename_keys(d, key_map):
     """
     return {key_map.get(key, key): value for key, value in d.items()}
 
-def extract_gs_meshgrid(fim_df, sweep_lambda_index):
+def extract_gt_meshgrid(fim_df, sweep_lambda_index):
     """
-    Extract gs FIM in meshgrid format along a single sweep direction.
+    Extract gt FIM in meshgrid format along a single sweep direction.
 
     Note: This function is different from meshgrid_transform_2D_fim
     in two main ways:
@@ -33,7 +38,7 @@ def extract_gs_meshgrid(fim_df, sweep_lambda_index):
     df = fim_df[fim_df["dir"] == str(sweep_lambda_index)]
     sweep_lambda_name = "lambda" + str(sweep_lambda_index)
     fixed_lambda_name = "lambda" + str(1 - sweep_lambda_index)
-    mg = classifim_gen.plot_tools.df_to_meshgrid(
+    mg = classifim.bench.plot_tools.df_to_meshgrid(
             df, sweep_lambda_name, fixed_lambda_name)
     # axis=0 means 'lambda_fixed', axis=1 means 'lambda_sweep':
     mg = rename_keys(mg, {
@@ -85,18 +90,18 @@ def w_smoothing(x, y, axis=0, extra_padding=1):
     y2 = np.moveaxis(y2, 0, axis)
     return y2
 
-def get_gs_peaks(
-        gs_mg, xmin=None, xmax=None, margin1=3/64, margin2=6/64,
+def get_gt_peaks(
+        gt_mg, xmin=None, xmax=None, margin1=3/64, margin2=6/64,
         min_prominence=1.0):
     """
     Get the peaks of the ground state FIM.
 
     Args:
-        gs_mg: dict describing the ground state FIM (in the meshgrid format).
+        gt_mg: dict describing the ground state FIM (in the meshgrid format).
             Keys: "lambda_fixed", "lambda_sweep", "fim".
-            Note that gs_mg cannot typically be obtained by reshaping
-            gs_fim_mgrid:
-            - gs_fim_mgrid values correspond to lambda_fixed between the
+            Note that gt_mg cannot typically be obtained by reshaping
+            gt_fim_mgrid:
+            - gt_fim_mgrid values correspond to lambda_fixed between the
                 values in the original grid.
             - other methods produce FIM estimates for lambda_fixed on the
                 original grid.
@@ -108,10 +113,13 @@ def get_gs_peaks(
         margin2: size of the inner margin. Peaks within this margin are
             not used in the accuracy calculation.
         min_prominence: ignore peaks with prominence less than this value.
+            Note: peaks with prominence between min_prominence / 2 and
+            min_prominence are still returned, but are not considered
+            for the accuracy calculation.
     """
-    fim = gs_mg["fim"] # axis 0: lambda_fixed, axis 1: lambda_sweep
-    lambda_sweep = gs_mg["lambda_sweep"]
-    lambda_fixed = gs_mg["lambda_fixed"]
+    fim = gt_mg["fim"] # axis 0: lambda_fixed, axis 1: lambda_sweep
+    lambda_sweep = gt_mg["lambda_sweep"]
+    lambda_fixed = gt_mg["lambda_fixed"]
 
     assert np.all(lambda_sweep[:-1] < lambda_sweep[1:]), (
             f"lambda_sweep is not sorted: {lambda_sweep}")
@@ -128,9 +136,11 @@ def get_gs_peaks(
     mean_fim = np.mean(fim)
     fim = np.pad(
         fim, [(0, 0), (1, 1)], mode='constant', constant_values=mean_fim)
-    peaks = [
-        scipy.signal.find_peaks(v, prominence=min_prominence)[0] - 1
+    raw_peaks = [
+        scipy.signal.find_peaks(v, prominence=min_prominence / 2)
         for v in fim]
+    prominences = [p[1]["prominences"] for p in raw_peaks]
+    peaks = [p[0] - 1 for p in raw_peaks]
     peak_xs = [lambda_sweep[p] for p in peaks]
 
     min_peak = np.array([np.min(p, initial=xmax) for p in peak_xs])
@@ -153,11 +163,20 @@ def get_gs_peaks(
 
     for i in add_left:
         peak_xs[i] = np.concatenate([[xmin], peak_xs[i]])
+        prominences[i] = np.concatenate([[0], prominences[i]])
     for i in add_right:
         peak_xs[i] = np.concatenate([peak_xs[i], [xmax]])
-    is_inner = [
-        ((xmin + margin2 < p) & (p < xmax - margin2)).astype(bool)
-        for p in peak_xs]
+        prominences[i] = np.concatenate([prominences[i], [0]])
+    try:
+        is_inner = [
+            ((xmin + margin2 < p)
+                & (p < xmax - margin2)
+                & (min_prominence <= pr)
+            ).astype(bool)
+            for p, pr in zip(peak_xs, prominences)]
+    except ValueError as e:
+        e.info = list(zip(peak_xs, prominences))
+        raise e
     lambda_fixed_ii = np.concatenate([
         np.full(len(p), i, dtype=int) for i, p in enumerate(peak_xs)])
     return {
@@ -168,23 +187,26 @@ def get_gs_peaks(
         "is_single": np.concatenate([
             np.full(len(p), len(p) == 1, dtype=bool) for p in peak_xs]),
         "num_peaks": np.array([len(p) for p in peak_xs]),
-        "num_inner_peaks": np.array([np.sum(flags) for flags in is_inner])}
+        "num_inner_peaks": np.array([np.sum(flags) for flags in is_inner]),
+        "xmin": xmin,
+        "xmax": xmax}
 
 def get_w_peaks(
         lambda_fixed, lambda_sweep, w_accuracy, num_peaks, postprocess=False,
-        lambda_fixed_expected=None):
+        lambda_fixed_expected=None, xrange=None):
     """
     Extract peaks from van Nieuwenburg's W.
 
     Args:
-        lambda_fixed: 1D np.ndarray
-        lambda_sweep: 1D np.ndarray
+        lambda_fixed, lambda_sweep: 1D np.ndarrays with grid coordinates.
         w_accuracy: 2D array with axis 0 corresponding to lambda_fixed
             and axis 1 corresponding to lambda_sweep.
         num_peaks: number of peaks (per each lambda_fixed) to extract.
         postprocess: whether to postprocess w_accuracy before extracting peaks.
         lambda_fixed_expected: if not None, verify that lambda_fixed values
             of the output are matching the expected values.
+        xrange: Used to blindly guess peaks if W predicts less peaks than
+            needed.
     """
     assert w_accuracy.shape == (len(lambda_fixed), len(lambda_sweep))
     assert num_peaks.shape == (len(lambda_fixed),)
@@ -196,7 +218,8 @@ def get_w_peaks(
             w_accuracy, [(0, 0), (1, 1)], mode='constant', constant_values=1.0)
     x = lambda_sweep
     x = np.concatenate([[2 * x[0] - x[1]], x, [2 * x[-1] - x[-2]]])
-    (peak_ifixed,), peak_x = find_peaks_v(x, w_accuracy, num_peaks, axis=1)
+    (peak_ifixed,), peak_x = find_peaks_v(
+        x, w_accuracy, num_peaks, axis=1, xrange=xrange)
     res_lambda_fixed = lambda_fixed[peak_ifixed]
     if lambda_fixed_expected is not None:
         assert np.array_equal(res_lambda_fixed, lambda_fixed_expected)
@@ -207,13 +230,22 @@ def get_w_peaks(
 
 def get_pca_peak(x, num_peaks):
     """
+    Args:
+        x: 2D array with axis 0 corresponding to lambda_sweep
+            and axis 1 corresponding to the PCA components.
+        num_peaks: number of peaks to extract.
+
     Returns:
         Array of length `num_peaks` with the number of elements of `x`
         to count until each peak. E.g. if res[0] = 3, then the peak
         is assumed to be between x[2] and x[3].
     """
     num_points, num_features = x.shape
-    scale = np.sum(np.std(x, axis=0)**2)**0.5
+    # Suppress high-frequency noise by scaling down features
+    # with high total variation:
+    total_variation = np.sum(np.abs(x[1:] - x[:-1]), axis=0)
+    avg_tv = np.mean(total_variation)
+    x = x * avg_tv / (0.1 * avg_tv + 0.9 * total_variation[None, :])
     dx0 = np.sum((x[1:] - x[:-1])**2, axis=1)**0.5
     x0 = np.empty(shape=(num_points, ), dtype=x.dtype)
     x0[0] = 0.0
@@ -233,7 +265,36 @@ def get_pca_peak(x, num_peaks):
     return np.cumsum(label_counts[ii][:-1])
 
 def get_pca_peaks(
-        lambda_fixed, lambda_sweep, pca, num_peaks, postprocess=False):
+        grid, pca, num_peaks, postprocess=False,
+        sweep_lambda_index=0):
+    """
+    Compute peak locations using SPCA data.
+
+    Args:
+        grid: a list of 1D arrays with grid coordinates
+            or tuples (start, stop, num_points).
+        pca: 3D array with
+            - axis 0 corresponding to lambda0
+            - axis 1 corresponding to lambda1
+            - axis 2 corresponding to the PCA components.
+        num_peaks: 1D array, number of peaks (per each lambda_fixed) to extract.
+        postprocess: whether to smoothen pca before extracting peaks.
+        sweep_lambda_index: index of the lambda_sweep axis in pca.
+    """
+    assert sweep_lambda_index in [0, 1]
+    assert len(grid) == 2
+    grid = grid[:]
+    for i in range(len(grid)):
+        if isinstance(grid[i], tuple):
+            grid[i] = np.linspace(*grid[i])
+    # Ensure that axis 1 corresponds to lambda_sweep:
+    if sweep_lambda_index == 0:
+        lambda_sweep = grid[0]
+        lambda_fixed = grid[1]
+        pca = pca.swapaxes(0, 1)
+    else:
+        lambda_sweep = grid[1]
+        lambda_fixed = grid[0]
     if postprocess:
         lambda_sweep, pca = smoothen_classifim_1d(lambda_sweep, pca, axis=1)
     peak_ii = [get_pca_peak(x, n) for x, n in zip(pca, num_peaks)]
@@ -259,7 +320,75 @@ def find_peaks(x, y, num_peaks):
     x_right = x[peaks]
     return np.sort((x_left + x_right) / 2)
 
-def find_peaks_v(x, y, num_peaks, axis=0):
+def blindly_guess_peaks(x, num_peaks):
+    """
+    Adds an uninformed guess of additional `num_peaks` peak locations.
+
+    Consider an algorithm predicting the peak locations. Say we know
+    there are $n$ peaks, but the algorithm only predicted $k < n$ peaks.
+    Which $n$ peak locations do we submit then? The best guess is to fill
+    the gaps between the predicted peak locations as 'equidistantly` as
+    possible. This function tries to do that. It is not guaranteed to
+    provide an optimal solution.
+
+    Args:
+        x: sorted 1D array of peak locations including the boundaries.
+        num_peaks: number of peaks to add.
+
+    Returns:
+        x with `num_peaks` additional peak locations inserted.
+    """
+    if num_peaks == 0:
+        return x
+    dx = np.diff(x)
+    assert np.all(dx > 0)
+    k = len(dx) # number of intervals
+    eps = np.nextafter(x.dtype.type(1), np.inf) - x.dtype.type(1)
+    lambda_lb = (1 - 4 * eps) * 1.5 / np.max(dx)
+    x_len = x[-1] - x[0]
+    lambda_ub = (1 + 4 * eps) * min(
+        (num_peaks + 1) / np.max(dx),
+        (num_peaks + 1.5 * k) / x_len)
+    cur_lambda = min(0.9 * lambda_ub, (num_peaks + k) / x_len)
+    ns_lb = None
+    ns_ub = None
+    while True:
+        ns = np.maximum(0, (cur_lambda * dx - 0.5).astype(int))
+        cur_num_peaks = np.sum(ns)
+        if cur_num_peaks == num_peaks:
+            break
+        if cur_num_peaks < num_peaks:
+            lambda_lb = cur_lambda
+            ns_lb = ns
+            cur_lambda = min(
+                lambda_lb + 0.9 * (lambda_ub - lambda_lb),
+                cur_lambda * (1 + num_peaks) / (1 + cur_num_peaks))
+        if cur_num_peaks > num_peaks:
+            lambda_ub = cur_lambda
+            ns_ub = ns
+            cur_lambda = max(
+                lambda_lb + 0.1 * (lambda_ub - lambda_lb),
+                cur_lambda * (1 + num_peaks) / (1 + cur_num_peaks))
+        if cur_lambda == lambda_lb or cur_lambda == lambda_ub:
+            ns = None
+            break
+    if ns is None:
+        assert ns_lb is not None and ns_ub is not None
+        dns = ns_ub - ns_lb
+        assert np.all((dns == 0) | (dns == 1))
+        ns = ns_lb
+        cur_num_peaks = np.sum(ns)
+        dns_idx = np.nonzero(dns)[0]
+        dns_idx = dns_idx[:num_peaks - cur_num_peaks]
+        ns[dns_idx] += 1
+    res = [
+        x[i] + (x[i + 1] - x[i]) * np.arange(n + 1) / (n + 1)
+        for i, n in enumerate(ns)]
+    res.append([x[-1]])
+    return np.concatenate(res)
+
+
+def find_peaks_v(x, y, num_peaks, xrange, axis=0):
     """
     Computes the locations of the peaks of `y`. As find_peaks, but vectorized.
 
@@ -268,6 +397,7 @@ def find_peaks_v(x, y, num_peaks, axis=0):
         y: array peaks of which we are trying to find.
         num_peaks: how many peaks are we trying to find (for each value of all
             indices of y except the index along axis).
+        xrange: pair (xmin, xmax) describing the interval for x values.
         axis: along which axis are we looking for peaks.
 
     Returns: pair with the following components:
@@ -290,7 +420,17 @@ def find_peaks_v(x, y, num_peaks, axis=0):
         cur_num_peaks = num_peaks[i]
         cur_res_x = find_peaks(x, y[i], cur_num_peaks)
         if cur_num_peaks > cur_res_x.shape[0]:
-            cur_res_x = np.append(cur_res_x, 0.5)
+            if xrange is None:
+                raise ValueError(
+                    "`y` didn't have enough peaks and xrange "
+                    "for blind guessing was not provided: "
+                    f"{cur_res_x.shape[0]} < {cur_num_peaks} "
+                    f"for idx={np.unravel_index(i, batch_size)}.")
+            xmin, xmax = xrange
+            cur_res_x = blindly_guess_peaks(
+                np.concatenate([[xmin], cur_res_x, [xmax]]),
+                cur_num_peaks - cur_res_x.shape[0])
+            cur_res_x = cur_res_x[1:-1]
         assert len(cur_res_x) == num_peaks[i], (
             f"len({cur_res_x}) != num_peaks[{i}] == {cur_num_peaks}")
         res_idx.append(np.full(fill_value=i, shape=cur_res_x.shape))
@@ -372,7 +512,7 @@ def smoothen_classifim_1d(x, y, axis, kernel0_size=5, kernel0_sigma=1.0, cut=1):
 
 def get_classifim_peaks(
         ml_mg, num_peaks, postprocess=False, lambda_fixed_expected=None,
-        lambda_fixed_tolerance=None):
+        lambda_fixed_tolerance=None, xrange=None):
     """
     Extract peaks from ClassiFIM predictions.
 
@@ -385,6 +525,7 @@ def get_classifim_peaks(
             of the output are matching the expected values.
         lambda_fixed_tolerance: if not None, adjust lambda_fixed values
             by at most this value to match lambda_fixed_expected.
+        xrange: Interval for peaks, used if guessing is needed.
     """
     x = ml_mg["lambda_sweep"]
     fim = ml_mg["fim"]
@@ -392,12 +533,13 @@ def get_classifim_peaks(
     assert num_peaks.shape == (len(ml_mg["lambda_fixed"]),)
     if postprocess:
         x, fim = smoothen_classifim_1d(x, fim, axis=1)
-    (peak_ifixed,), peak_x = find_peaks_v(x, fim, num_peaks, axis=1)
+    (peak_ifixed,), peak_x = find_peaks_v(x, fim, num_peaks, axis=1, xrange=xrange)
     res_lambda_fixed = ml_mg["lambda_fixed"][peak_ifixed]
     if lambda_fixed_expected is not None:
         if lambda_fixed_tolerance is not None:
             np.testing.assert_allclose(
-                res_lambda_fixed, lambda_fixed_expected)
+                res_lambda_fixed, lambda_fixed_expected,
+                atol=lambda_fixed_tolerance)
             res_lambda_fixed = lambda_fixed_expected
         np.testing.assert_array_equal(res_lambda_fixed, lambda_fixed_expected)
     return {
@@ -405,18 +547,29 @@ def get_classifim_peaks(
         "lambda_fixed": res_lambda_fixed,
         "lambda_sweep": peak_x}
 
-def set_error(group, x_gt, x_pred, x_gt_ii=None):
+def set_error(
+        group, x_gt, x_pred, x_gt_ii=None, xmin=None, xmax=None, verbosity=1):
     """
     Args:
-        group is a sorted array describing how x_gt and x_pred indices are split into groups:
-            indices i and j are in the same group iff group[i] == group[j]
-        x_gt describes a ground truth set for each of the groups. Its values within each group are sorted in ascending order.
-        x_gt_ii: If specified, should be bool array: use only selected values of x_gt.
-        x_pred describes predicted sets. Its values within each group are sorted in ascending order.
-    Returns:
-        Error is computed as follows:
-            * For each j let x = x_gt[j]. Find y closest to x in values x_pred corresponding to the same group. Then compute the error_j = (x - y)**2.
-            * Return average over j of error_j.
+        group is a sorted array describing how x_gt and x_pred indices are split
+            into groups: indices i and j are in the same group
+            iff group[i] == group[j]
+        x_gt describes a ground truth set for each of the groups. Its values
+            within each group are sorted in ascending order.
+        x_gt_ii: If specified, should be bool array: use only selected values of
+            x_gt.
+        x_pred describes predicted sets. Its values within each group are sorted
+            in ascending order.
+        xmin, xmax: boundary of the region. If specified, error is bounded by the
+            distance to the nearest boundary.
+        verbosity: 0: no warnings, 1: warnings,
+            2+: debug info may be added in the future.
+
+    Error is computed as follows:
+        * For each j let x = x_gt[j]. Find y closest to x in values x_pred
+            corresponding to the same group.
+            Then compute the error_j = (x - y)**2.
+    Returns: mean_j(error_j)
     """
     n = len(group)
     assert group.shape == (n,)
@@ -424,6 +577,10 @@ def set_error(group, x_gt, x_pred, x_gt_ii=None):
     assert x_pred.shape == (n,)
     if x_gt_ii is None:
         x_gt_ii = np.full(fill_value=True, shape=x_gt.shape)
+    if np.sum(x_gt_ii) == 0:
+        if verbosity >= 1:
+            warnings.warn("No ground truth values selected.")
+        return np.nan
     _, group_idx = np.unique(group, return_index=True)
     num_groups = len(group_idx)
     group_idx = np.concatenate([group_idx, [len(group)]])
@@ -439,6 +596,10 @@ def set_error(group, x_gt, x_pred, x_gt_ii=None):
         cur_x_pred = x_pred[i0:i1]
         cur_error = (cur_x_gt[:, np.newaxis] - cur_x_pred[np.newaxis, :])**2
         cur_error = np.min(cur_error, axis=1)
+        if xmin is not None:
+            cur_error = np.minimum(cur_error, (cur_x_gt - xmin)**2)
+        if xmax is not None:
+            cur_error = np.minimum(cur_error, (cur_x_gt - xmax)**2)
         res += np.sum(cur_error)
     return res / np.sum(x_gt_ii)
 
@@ -457,35 +618,160 @@ def test_set_error():
 
 test_set_error()
 
-def compute_peak_rmses(gs_peaks, model_peaks_dict):
+def compute_peak_rmses(gt_peaks, model_peaks_dict, verbosity=1):
     """
     Args:
-        gs_peaks: dict with keys
+        gt_peaks: dict with keys
             'lambda_fixed', 'lambda_sweep', 'is_inner', 'is_single'
         model_peaks_dict: dict with elements key: value where key is model name
             and value is a dict.
+        verbosity: 0: no warnings, 1: warnings, 2+: possibly additional info.
 
     Returns:
         RMSE stats of the peak locations predicted by the models.
     """
-    gs_peak_y = gs_peaks["lambda_fixed"]
-    gs_peak_x = gs_peaks["lambda_sweep"]
-    assert gs_peak_y.shape == gs_peak_x.shape
-    assert len(gs_peak_y.shape) == 1
-    ii = gs_peaks["is_inner"]
-    assert ii.shape == gs_peak_y.shape
-    ii_single = ii & gs_peaks["is_single"]
+    gt_peak_y = gt_peaks["lambda_fixed"]
+    gt_peak_x = gt_peaks["lambda_sweep"]
+    assert gt_peak_y.shape == gt_peak_x.shape
+    assert len(gt_peak_y.shape) == 1
+    ii = gt_peaks["is_inner"]
+    assert ii.shape == gt_peak_y.shape
+    ii_single = ii & gt_peaks["is_single"]
     res = {
-        "num_peaks": len(gs_peak_y),
+        "num_peaks": len(gt_peak_y),
         "num_acc_peaks": np.sum(ii),
         "num_single_peaks": np.sum(ii_single)}
+    boundary_kwargs = {
+        key: gt_peaks[key] for key in ["xmin", "xmax"] if key in gt_peaks}
     for key, value in model_peaks_dict.items():
         res[key] = set_error(
-            gs_peak_y, x_gt=gs_peak_x, x_gt_ii=ii,
-            x_pred=value["lambda_sweep"])**0.5
+            gt_peak_y, x_gt=gt_peak_x, x_gt_ii=ii,
+            x_pred=value["lambda_sweep"], **boundary_kwargs,
+            verbosity=verbosity)**0.5
 
     for key, value in model_peaks_dict.items():
         res[key + "_single"] = set_error(
-            gs_peak_y, x_gt=gs_peak_x, x_gt_ii=ii_single,
-            x_pred=value["lambda_sweep"])**0.5
+            gt_peak_y, x_gt=gt_peak_x, x_gt_ii=ii_single,
+            x_pred=value["lambda_sweep"],
+            verbosity=verbosity)**0.5
     return res
+
+def paired_t_tests(df, verbose=False, metric_name="smooth_peaks", key_name="seed"):
+    grouped = df.groupby("method_name")
+
+    method_dfs = {}
+    for method, group in grouped:
+        metrics = group.set_index(key_name)[metric_name]
+        v = np.mean(metrics)
+        method_dfs[method] = (v, metrics)
+    method_names = list(method_dfs.keys())
+    results = {}
+    for method1, method2 in itertools.combinations(method_names, 2):
+        v1, metrics1 = method_dfs[method1]
+        v2, metrics2 = method_dfs[method2]
+        aligned = pd.concat(
+            [metrics1, metrics2], axis=1, keys=[method1, method2]).dropna()
+        t_stat, p_val = scipy.stats.ttest_rel(
+                aligned[f"{method1}"],
+                aligned[f"{method2}"])
+        results[(method1, method2)] = {
+            "t_stat": t_stat, "p_val": p_val, "mean1": v1, "mean2": v2}
+        if verbose:
+            sign = "≈"
+            if p_val < 0.05:
+                sign = "<" if v1 < v2 else ">"
+            print(
+                f"{method1} vs {method2}: "
+                f"{v1:.3f} {sign} {v2:.3f} "
+                f"(t-stat={t_stat:.3f}, p={p_val:.3f})")
+    return results
+
+DEFAULT_PEAK_ERROR_METRICS = {
+    "num_peaks": ["peaks", "smooth_peaks"],
+    "num_peaks_single": ["peaks_single", "smooth_peaks_single"]}
+
+def peak_errors2d_to_df(peak_errors, top_keys=None, metric_names=None):
+    """
+    Convert peak errors to a DataFrame.
+
+    Args:
+        peak_errors: list, with each element being a dict with keys
+            - seed, sweep_lambda_index
+            - values for count columns
+            - methods: list of method names. Should be the same for all elements.
+            - Values with keys "{method_name}_{metric_name}".
+        top_keys: List of top level keys.
+        metric_names: dict with count columns as keys and lists of metric names
+            as values.
+
+    Returns:
+        DataFrame with columns:
+            - "seed", "sweep_lambda_index", "method_name",
+            - columns corresponding to count and metric names.
+    """
+    if top_keys is None:
+        top_keys = ["seed", "sweep_lambda_index"]
+    dfs = []
+    metric_names = metric_names or DEFAULT_PEAK_ERROR_METRICS
+    count_names = list(metric_names.keys())
+    metric_names_flat = list(itertools.chain(*metric_names.values()))
+    for cur_peak_errors in peak_errors:
+        cur_df = {
+            key: cur_peak_errors[key]
+            for key in top_keys + count_names}
+        cur_df.update(**{k: [] for k in metric_names_flat + ["method_name"]})
+        for method_name in cur_peak_errors["methods"]:
+            cur_df["method_name"].append(method_name)
+            for metric_name in metric_names_flat:
+                cur_df[metric_name].append(
+                    cur_peak_errors[method_name + "_" + metric_name])
+        dfs.append(pd.DataFrame(cur_df))
+    peak_metrics_df_raw = pd.concat(dfs, ignore_index=True)
+    return peak_metrics_df_raw
+
+def strict_series_sum(x):
+    return x.sum(skipna=False)
+
+def peak_errors2d_agg_sweeps(
+        peak_metrics_df_raw, metric_names=None, keys=None):
+    """
+    Aggregate peak errors over sweeps.
+
+    Metrics are assumed to be RMSEs, i.e. they are aggregated using the formula
+    $x = \sqrt{\sum_j n_j x_j^2 / \sum_j n_j}$.
+
+    Args:
+        peak_metrics_df_raw: DataFrame with columns
+            - "seed", "sweep_lambda_index", "method_name",
+            - columns corresponding to count and metric names.
+        metric_names: dict with count columns as keys and lists of metric names
+            as values,
+        keys: list of keys to group by.
+
+    Returns:
+        DataFrame with columns:
+            - "seed", "method_name", "num_rows"
+            - columns corresponding to count and metric names.
+    """
+    if keys is None:
+        keys = ["seed", "method_name"]
+    df = peak_metrics_df_raw.copy()
+    metric_names = metric_names or DEFAULT_PEAK_ERROR_METRICS
+    count_names = list(metric_names.keys())
+    metric_names_flat = list(itertools.chain(*metric_names.values()))
+    for count_name, cur_metric_names in metric_names.items():
+        count_s = df[count_name]
+        for metric_name in cur_metric_names:
+            metric_s = df[metric_name]
+            df[metric_name] = np.where(count_s == 0., 0., metric_s**2 * count_s)
+    df = df.groupby(keys).agg(
+        num_rows=("sweep_lambda_index", "size"),
+        **{k: (k, strict_series_sum) for k in count_names + metric_names_flat})
+    for count_name, cur_metric_names in metric_names.items():
+        count_s = df[count_name]
+        for metric_name in cur_metric_names:
+            metric_s = df[metric_name]
+            df[metric_name] = np.sqrt(metric_s / count_s)
+    df.reset_index(inplace=True)
+    return df
+

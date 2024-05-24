@@ -99,8 +99,8 @@ class MnistZsTransform:
 #   - zs: (batch_size, 2, num_classes) samples.
 #   - zxs: (batch_size, 1, img_width, img_height) images.
 # - Output is a tensor of shape (batch_size, num_lambdas). For convenience,
-#   the second, postprocessed, output is provided, which is used in the
-#   cross-entropy loss:
+#       the second, postprocessed, output is provided, which is used in the
+#       cross-entropy loss:
 #   - output1: tensor of shape (*batch_size, num_lambdas).
 #         Represents the output of NN before sigmoid.
 #         The purpose of the model is to make this output available.

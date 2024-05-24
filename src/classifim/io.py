@@ -1,5 +1,6 @@
 import hashlib
 import numpy as np
+import pyarrow as pa
 import sys
 
 def fil24_unpack_zs(zs):
@@ -49,7 +50,7 @@ def split_train_test(dataset, test_size=0.1, seed=0, scalar_keys=()):
             continue
         if num_samples is None:
             rng = np.random.default_rng(seed)
-            num_samples = next(iter(dataset.values())).shape[0]
+            num_samples = value.shape[0]
             test_ii0 = rng.choice(
                     num_samples, size=int(test_size * num_samples), replace=False)
             test_ii = np.zeros(num_samples, dtype=bool)
@@ -242,6 +243,44 @@ def unflatten_dict_from_npz(d, sep="."):
         cur[key] = v
     return res
 
+def samples1d_uint8_to_bytes(samples):
+    """
+    Convert (n_samples, width) array of individual bytes to a 1D array of bytes.
+
+    Args:
+        samples: numpy array of shape (n_samples, width) of dtype with itemsize 1.
+    """
+    assert samples.itemsize == 1
+    assert samples.dtype in [np.int8, np.uint8, np.dtype((np.bytes_, 1))]
+    num_samples, width = samples.shape
+    # Convert to np.uint8 to ensure consistent behavior.
+    samples = samples.astype(np.uint8)
+    samples = np.frombuffer(
+        samples.tobytes(),
+        dtype=np.dtype((np.bytes_, width)))
+    assert samples.shape == (num_samples, )
+    return samples
+
+def samples1d_bytes_to_uint8(samples, width=None):
+    """
+    Convert a 1D array of bytes to an array of individual bytes.
+
+    Args:
+        samples: numpy array of shape (n_samples, ) of dtype
+            (np.bytes_, width).
+        width: width of the grid.
+
+    Returns:
+        numpy array of shape (n_samples, width) of dtype np.uint8.
+    """
+    num_samples, = samples.shape
+    num_bytes = samples.itemsize
+    if width is not None:
+        assert num_bytes == width
+    samples = np.frombuffer(samples.tobytes(), dtype=np.uint8)
+    samples = samples.reshape((num_samples, num_bytes))
+    return samples
+
 def samples2d_to_bytes(samples, width):
     """
     Convert (n_samples, height, width) array of bits stored as
@@ -285,11 +324,29 @@ def samples2d_to_bytes(samples, width):
     n_bytes = (n_bits + 7) // 8
     output_bytes = out_buf.view(np.uint8).reshape((n_samples, n_words * 8))[
             :, :n_bytes]
-    output_bytes = np.frombuffer(
-        output_bytes.tobytes(),
-        dtype=np.dtype((np.bytes_, n_bytes)))
-    assert output_bytes.shape == (n_samples, )
-    return output_bytes
+    return samples1d_uint8_to_bytes(output_bytes)
+
+def bytes_to_pa(in_bytes):
+    """
+    Convert a numpy array of bytes to a PyArrow array.
+
+    Specifically, we assume that all entries in `in_bytes` have the same length
+    `in_bytes.itemsize` produce the output array of type `pa.binary()`
+    (not `pa.binary(in_bytes.itemsize)` because the latter is not supported
+    by HuggingFace datasets).
+
+    References:
+    * https://github.com/apache/arrow/issues/41388
+    * https://stackoverflow.com/questions/78359858
+
+    Args:
+        in_bytes: numpy array of bytes.
+
+    Returns:
+        PyArrow array.
+    """
+    fixed_len_array = pa.array(in_bytes, type=pa.binary(in_bytes.itemsize))
+    return fixed_len_array.cast(pa.binary())
 
 def bytes_to_samples2d(in_bytes, height, width):
     """
@@ -343,3 +400,44 @@ def bytes_to_samples2d(in_bytes, height, width):
                 samples[:, j] |= width_mask & (
                         in_words[:, word_i] << (np_width - bit_i))
     return samples
+
+def pa_to_np(pa_array):
+    """
+    Convert a PyArrow array to a numpy array.
+
+    Most of the time, this is equivalent to pa_array.to_numpy(),
+    but for binary arrays a conversion to np.dtype((np.bytes_, n_bytes))
+    is attempted. This assumes that all binary array fields have fixed
+    length.
+
+    Args:
+        pa_array: PyArrow array.
+
+    Returns:
+        numpy array.
+    """
+    if pa_array.type == pa.binary() and len(pa_array) > 0:
+        n_bytes = len(pa_array[0].as_py())
+        try:
+            return pa_array.to_numpy().astype(np.dtype((np.bytes_, n_bytes)))
+        except Exception:
+            pass
+    return pa_array.to_numpy()
+
+def prepare_for_json(obj):
+    """
+    Prepare an object for saving to a JSON file.
+
+    This loses some information (e.g. {'a'} becomes ['a']).
+
+    Args:
+        obj: object to prepare.
+
+    Returns:
+        Data structure that can be saved to a JSON file.
+    """
+    if isinstance(obj, dict):
+        return {str(k): prepare_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [prepare_for_json(v) for v in obj]
+    return obj

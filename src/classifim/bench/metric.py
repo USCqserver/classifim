@@ -9,7 +9,24 @@ import numpy as np
 import os
 import scipy.stats
 import sys
-from classifim_gen.linalg import average_consecutive
+
+def average_consecutive(a: np.ndarray, axis: int = 0) -> np.ndarray:
+    """
+    Computes the average of consecutive elements along a specified axis.
+
+    Args:
+        a (np.ndarray): Input array.
+        axis (int, optional): The axis along which to compute the average of
+            consecutive elements. Default is 0.
+
+    Returns:
+        np.ndarray: The input array, but with each pair of consecutive elements
+            along the specified axis replaced by their average, hence the size
+            along that axis is reduced by 1.
+    """
+    a = np.moveaxis(a, axis, 0)
+    a = (a[1:] + a[:-1]) / 2
+    return np.moveaxis(a, 0, axis)
 
 def _get_lib():
     extension = {
@@ -18,8 +35,9 @@ def _get_lib():
     }.get(sys.platform, ".so")
     lib_path = os.path.join(
         os.path.dirname(__file__),
+        '..',
         'lib',
-        'libclassifim_gen' + extension)
+        'libclassifim' + extension)
     lib = ctypes.CDLL(lib_path)
     return lib
 
@@ -519,47 +537,66 @@ def normal_summary(a, digits=4):
     a_err = np.std(a)
     return f"{a_mean:.{digits}f} \pm {a_err:.{digits}f}"
 
-def lambda_pairs_nd(
-        resolution=64, num_pairs=83866, space_dim=2, seed=0, lambda_max=None):
+def lambda_pairs_nd(grid, num_pairs=83866, seed=0):
     """
     Generates np.ndarray with pairs of lambda values for N-dimensional space.
 
     Args:
-        resolution: resolution of the grid of lambdas.
+        grid: a list of tuples of the form (start, stop, num) for each
+            dimension.
         num_pairs: maximal number of pairs to generate.
-        space_dim: number of dimensions of the space.
         seed: random seed for sampling.
-        lambda_max: maximal value of lambda to sample.
-            Defaults to (resolution - 1) / resolution.
-
-    Returns:
-        Pair of np.ndarrays of shape (num_pairs, space_dim) with lambda values.
-        I.e. the overall shape is (2, num_pairs, space_dim).
     """
-    # Generate an N-dimensional grid
-    if lambda_max is None:
-        lambda_max = (resolution - 1) / resolution
-    ranges = [
-        np.linspace(0, lambda_max, resolution)
-        for _ in range(space_dim)]
-    grid = np.meshgrid(*ranges, indexing='ij')
-    lambdas = np.stack(grid, axis=-1).reshape(-1, space_dim)
-
-    # Compute all possible pairs
-    num_lambdas = lambdas.shape[0]
-    assert num_lambdas == resolution ** space_dim
-    num_all_pairs = num_lambdas * (num_lambdas - 1) // 2
+    starts = []
+    stops = []
+    num_points = []
+    for start, stop, num in grid:
+        starts.append(start)
+        stops.append(stop)
+        num_points.append(num)
+    tot_num_points = np.prod(num_points)
+    assert isinstance(tot_num_points, (int, np.int64))
+    assert tot_num_points >= 2
+    if tot_num_points > 2**27:
+        raise ValueError(
+            "Current implementation does not support more than 2**27 points "
+            "due to finite precision arithmetic used in the algorithm. "
+            f"Got {tot_num_points}.")
+    num_all_pairs = tot_num_points * (tot_num_points - 1) // 2
     if num_pairs < num_all_pairs:
         rng = np.random.default_rng(seed)
         lambda_pair_ii = rng.choice(
             num_all_pairs, size=num_pairs, replace=False)
     else:
-        lambda_pair_ii = np.arange(num_all_pairs)
-    lambda_a_ii = (0.5 + np.sqrt(2 * lambda_pair_ii + 0.25)).astype(int)
+        lambda_pair_ii = np.arange(num_all_pairs, dtype=np.int64)
+        num_pairs = num_all_pairs
+    lambda_a_ii = (0.5 + np.sqrt(2 * lambda_pair_ii + 0.25)).astype(np.int64)
     lambda_b_ii = lambda_pair_ii - lambda_a_ii * (lambda_a_ii - 1) // 2
     assert np.all(lambda_b_ii < lambda_a_ii)
     assert np.all(lambda_b_ii >= 0)
-    return lambdas[lambda_a_ii], lambdas[lambda_b_ii]
+    if num_pairs * 2 < tot_num_points:
+        starts = np.array(starts)[None, :]
+        stops = np.array(stops)[None, :]
+        num_points = np.array(num_points)[None, :]
+        deltas = (stops - starts) / (num_points - 1)
+        num_points_tuple = tuple(num_points[0])
+        def get_lambda(ii):
+            ii = np.unravel_index(ii, num_points_tuple)
+            ii = np.stack(ii, axis=-1)
+            return starts + ii * deltas
+        return get_lambda(lambda_a_ii), get_lambda(lambda_b_ii)
+    else:
+        num_space_dims = len(grid)
+        all_lambdas = np.empty(
+            (*num_points, num_space_dims), dtype=np.float64)
+        for j in range(num_space_dims):
+            all_lambdas[..., j] = np.linspace(
+                starts[j], stops[j], num_points[j]).reshape(
+                    tuple(
+                        num_points[j] if l == j else 1
+                        for l in range(num_space_dims)))
+        all_lambdas = all_lambdas.reshape(-1, num_space_dims)
+        return all_lambdas[lambda_a_ii], all_lambdas[lambda_b_ii]
 
 def mse_perfect_scale(predicted, target):
     """
@@ -571,13 +608,17 @@ def mse_perfect_scale(predicted, target):
     scale = (predicted @ target) / np.sum(predicted**2)
     return scale, np.mean((target - scale * predicted) ** 2)
 
-def _finalize_distance_errors(distances, lambda_pairs, use_cpp):
+def _finalize_distance_errors(
+        distances, lambda_pairs, use_cpp, include_distSL_distances):
     """
     Finalizes the results of compute_distance_errors.
 
     Args:
         distances: np.ndarray of shape (2, num_pairs) with SL distances.
         lambda_pairs: A pair of np.ndarrays of shape (num_pairs, space_dim).
+        use_cpp: whether to use the C++ implementation.
+        include_distSL_distances: whether to include the lambda pairs and
+            distSL distances in the output.
 
     Returns:
         Dictionary with error metrics.
@@ -592,8 +633,6 @@ def _finalize_distance_errors(distances, lambda_pairs, use_cpp):
     scale, mse = mse_perfect_scale(distSL_a, distSL_b)
     res = {
         "num_pairs": num_pairs,
-        "lambda_pairs": lambda_pairs,
-        "distances": distances,
         "distMSE": np.mean((distances[0] - distances[1]) ** 2),
         "distRE": compute_ranking_error(
             distances[0], distances[1], use_cpp=use_cpp),
@@ -605,25 +644,33 @@ def _finalize_distance_errors(distances, lambda_pairs, use_cpp):
         "distMSE_perfect_scale": mse,
         "space_dim": space_dim,
         "scale": scale}
+    if include_distSL_distances:
+        res["lambda_pairs"] = lambda_pairs
+        res["distances"] = distances
     return res
 
 def compute_distance_errors(
-        fim_mgrid_a, fim_mgrid_b, grid_resolution=64, num_pairs=83866,
-        seed=0, use_cpp=False):
+        grid, fim_mgrid_a, fim_mgrid_b, num_pairs=83866,
+        seed=0, use_cpp=False, include_distSL_distances=True):
     """
     Computes distMSE and distRE between two metrics.
 
     Args:
+        grid: a list of tuples of the form (start, stop, num)
+            describing the grid in the parameter space.
         fim_mgrid_a, fim_mgrid_b: two fim_mgrid's two compare.
             Both should be compatible with StraightLineDistance.from_fim_mgrid.
-        grid_resolution: resolution of 2D lambda grid.
         num_pairs: maximal number of pairs to sample.
+        seed: random seed for pair sampling.
+        use_cpp: whether to use the C++ or Python implementation.
+        include_distSL_distances: whether to include the lambda pairs and
+            distSL distances in the output. True by default because it is
+            the most expensive part of the computation.
 
     Returns:
         Dictionary with error metrics.
     """
-    lambda_pairs = lambda_pairs_nd(
-        resolution=grid_resolution, num_pairs=num_pairs, seed=seed, space_dim=2)
+    lambda_pairs = lambda_pairs_nd(grid, num_pairs=num_pairs, seed=seed)
     if use_cpp:
         # lambda_pairs_nd returns the shape (2, num_pairs, space_dim)
         # but StraightLineDistanceCpp expects the shape
@@ -644,15 +691,19 @@ def compute_distance_errors(
         distances = np.array([
             [f(*lambdas) for lambdas in zip(*lambda_pairs)]
             for f in distance_fs])
-    return _finalize_distance_errors(distances, lambda_pairs, use_cpp=use_cpp)
+    return _finalize_distance_errors(
+        distances, lambda_pairs, use_cpp=use_cpp,
+        include_distSL_distances=include_distSL_distances)
 
 def compute_distance_errors_1d(
-        fim_a, fim_b, num_pairs=83866, seed=0, cpp_version=None,
-        lambda_min=None):
+        grid, fim_a, fim_b, num_pairs=83866, seed=0, cpp_version=None,
+        include_distSL_distances=False):
     """
     Computes distMSE and distRE between two metrics.
 
     Args:
+        grid: a tuple of the form (start, stop, num)
+            A one-element list with such tuple is also accepted.
         fim_a, fim_b: two fim's two compare.
             Both should be compatible with StraightLineDistance.from_fim_mgrid.
         grid_resolution: resolution of 2D lambda grid.
@@ -660,24 +711,23 @@ def compute_distance_errors_1d(
         seed: random seed.
         cpp_version: None, "cpp", or "cpp1d". End with "-" to avoid C++ in
             the computation of the ranking error.
+        lambda_min, lambda_max: the interval for which the distSL is defined.
+        include_distSL_distances: whether to include the lambda pairs and
+            distSL distances in the output. False by default because
+            for 1D it is reasonably fast, but takes a non-negligible
+            amount of memory (e.g. it is faster to recompute than to
+            compress/decompress for saving and loading).
 
     Returns:
         Dictionary with error metrics.
     """
-    assert "lambda1" not in fim_a and "lambda1" not in fim_b
-    lambda0s = np.array(fim_b["lambda0"])
-    assert np.all(lambda0s[1:] > lambda0s[:-1])
-    lambda_max = lambda0s[-1] * 1.5 - lambda0s[-2] * 0.5
-    if lambda_min is None:
-        lambda_min = lambda0s[0] * 1.5 - lambda0s[1] * 0.5
-        assert np.abs(lambda_min) <= 2.0 * 2**(-23)
+    if isinstance(grid, tuple):
+        assert len(grid) == 3, f"{grid=}"
+        grid = [grid]
     else:
-        assert lambda_min <= lambda0s[0]
-        assert lambda_min >= 2 * lambda0s[0] - lambda0s[1]
-    grid_resolution = len(lambda0s) + 1
-    lambda_pairs = lambda_pairs_nd(
-        resolution=grid_resolution, num_pairs=num_pairs, seed=seed, space_dim=1,
-        lambda_max=lambda_max)
+        assert len(grid) == 1, f"{grid=}"
+    assert "lambda1" not in fim_a and "lambda1" not in fim_b
+    lambda_pairs = lambda_pairs_nd(grid, num_pairs=num_pairs, seed=seed)
     if cpp_version is None:
         distance_fs = (
             StraightLineDistance.from_fim_1d(g)
@@ -704,4 +754,6 @@ def compute_distance_errors_1d(
         distances = np.array([
             f.distances(lambda_pairs_cpp)
             for f in distance_fs])
-    return _finalize_distance_errors(distances, lambda_pairs, use_cpp=use_cpp)
+    return _finalize_distance_errors(
+        distances, lambda_pairs, use_cpp=use_cpp,
+        include_distSL_distances=include_distSL_distances)

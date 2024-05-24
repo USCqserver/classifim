@@ -1,5 +1,5 @@
-import classifim.pipeline
 import classifim.data_loading
+import classifim.pipeline
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,8 +9,7 @@ class DataLoader(classifim.data_loading.InMemoryLoader):
     def _init_zs(self, data, device):
         zs = data["zs"]
         assert len(zs.shape) == 2
-        self.zs = torch.from_numpy(zs).to(
-            device=device, dtype=torch.uint8)
+        self.zs = torch.from_numpy(zs).to(device=device, dtype=torch.uint8)
 
     def _retrieve_zs(self, ii):
         return (self.zs[ii], )

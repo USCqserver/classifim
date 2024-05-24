@@ -4,7 +4,11 @@ Utils for van Nieuwenburg's W.
 
 import classifim.pipeline
 import datetime
+import datasets
+import json
+import os
 import numpy as np
+import time
 import torch
 import torch.nn as nn
 
@@ -168,32 +172,38 @@ class BatchLinear(nn.Module):
 
         return x_out
 
-class Pipeline(classifim.pipeline.Pipeline):
-    def __init__(self, config):
-        assert config["hold_out_test"], (
-            "hold_out_test=False is not supported: "
-            + "self.dataset_test slot is used for validation set, "
-            + "which is used for computing the W.")
-        super().__init__(config)
+class WPreprocessor:
+    def __init__(self, sweep_lambda_index, scalar_keys=None):
+        self.sweep_lambda_index = sweep_lambda_index
+        self.scalar_keys = scalar_keys
 
     def _transform(self, dataset):
-        sweep_lambda_index = self.config["sweep_lambda_index"]
         transform_dataset(
-            dataset, sweep_lambda_index, self.config["scalar_keys"])
+            dataset,
+            sweep_lambda_index=self.sweep_lambda_index,
+            scalar_keys=self.scalar_keys)
 
     def fit_transform(self, dataset):
         self._transform(dataset)
         self.lambda_sweep_thresholds = dataset["lambda_sweep_thresholds"]
-        model_kwargs = self.config.get("model_init_kwargs", {})
-        if "layer_bs" not in model_kwargs:
-            model_kwargs["layer_bs"] = len(self.lambda_sweep_thresholds)
-        self.config["model_init_kwargs"] = model_kwargs
+        self.layer_bs = len(dataset["lambda_sweep_thresholds"])
 
     def transform(self, dataset):
         self._transform(dataset)
         np.testing.assert_allclose(
             self.lambda_sweep_thresholds,
             dataset["lambda_sweep_thresholds"])
+
+class Pipeline(classifim.pipeline.Pipeline):
+    def __init__(self, config, preprocessor=None, **kwargs):
+        preprocessor = preprocessor or WPreprocessor(
+            scalar_keys=config.get('scalar_keys', []),
+            sweep_lambda_index=config['sweep_lambda_index'])
+        assert config["hold_out_test"], (
+            "hold_out_test=False is not supported: "
+            + "self.dataset_test slot is used for validation set, "
+            + "which is used for computing the W.")
+        super().__init__(config=config, preprocessor=preprocessor, **kwargs)
 
     def _get_data_loader(
             self, dataset, is_train, batch_size=None, device=None,
@@ -352,8 +362,109 @@ class Pipeline(classifim.pipeline.Pipeline):
         res["lambda_fixed_i"] = np.array(list(self.w.keys()))
         res["lambda_fixed"] = self.dataset_train["lambda_fixed_unique"][
             res["lambda_fixed_i"]]
-        res["lambda_sweep_thresholds"] = self.lambda_sweep_thresholds
+        res["lambda_sweep_thresholds"] = (
+                self.preprocessor.lambda_sweep_thresholds)
         file_name = self.config["w_filename"]
         np.savez_compressed(file_name, **res)
         print(f"{datetime.datetime.now()}: Saved W to {file_name}.")
 
+def config_set_default_filenames(config, models_dir, suffix=None):
+    if suffix is None:
+        suffix = f"{config['seed']:02d}"
+    if "model_filename" not in config:
+        config["model_filename"] = os.path.join(
+            models_dir,
+            f"{config['model_name']}_{suffix}_{config['sweep_lambda_index']}_"
+            + "{lambda_fixed_i}.pth")
+    if "w_filename" not in config:
+        config["w_filename"] = os.path.join(
+            models_dir,
+            f"{config['model_name']}_{suffix}_"
+            f"{config['sweep_lambda_index']}.w.npz")
+    if "log_filename" not in config:
+        config['log_filename'] = os.path.join(
+            models_dir,
+            f"{config['model_name']}_{suffix}_"
+            f"{config['sweep_lambda_index']}.log.json")
+
+def run_pipeline(
+        sm_name, gen_config_f, gen_pipeline_f, seed, sweep_lambda_index=None,
+        skip_existing=True):
+    """
+    Run van Nieuwenburg's pipeline for 1D or 2D statistical manifold.
+
+    Args:
+        sm_name: The name of the statistical manifold.
+        gen_config_f: A function that generates a config dictionary.
+        gen_pipeline_f: A function that generates a pipeline.
+        seed: The seed, which is used in two ways:
+            - the index (aka seed) of the dataset to load,
+            - the seed for model training and evaluation.
+        sweep_lambda_index: The index of the lambda to sweep. This should
+            be None if and only if the statistical manifold is 1D.
+        skip_existing: If True, skip the pipeline if the output files
+            already exist.
+    """
+    t0 = time.time()
+    def load_split(split):
+        d_split_ds = datasets.load_dataset(
+            os.path.expanduser('fiktor/FIM-Estimation'),
+            f"{sm_name}.seed{seed:02d}", split=split)
+        return classifim.datasets.dataset_huggingface_to_dict(d_split_ds)
+    d_train = load_split("train")
+    d_test = load_split("test")
+
+    assert d_train["seed"] == seed
+    t1 = time.time()
+    config = gen_config_f(
+        sm_name=sm_name, seed=seed, sweep_lambda_index=sweep_lambda_index)
+    cur_log = {"config": config, "train": []}
+    print(f"{datetime.datetime.now()}: {config['model_name']}_{config['seed']}")
+    if skip_existing and os.path.exists(config["w_filename"]):
+        print(f"{config['w_filename']} already exists")
+        return
+    print(f"Computing {config['w_filename']}")
+    pipeline = gen_pipeline_f(config=config, d_train=d_train)
+    t3 = t2 = time.time()
+    dt2_train = 0
+    dt3_save = 0
+    dt4_eval = 0
+    for lambda_fixed_i in range(len(
+            pipeline.dataset_train["lambda_fixed_unique"])):
+        print(f"{datetime.datetime.now()}: Train i={lambda_fixed_i}")
+        pipeline.config["lambda_fixed_i"] = lambda_fixed_i
+        pipeline.init_model()
+        cur_log["train"].append(pipeline.train())
+        t4 = time.time()
+        dt2_train += t4 - t3
+        print(f"{datetime.datetime.now()}: Save")
+        pipeline.save_model()
+        pipeline.cleanup_after_training()
+        pipeline.load_model()
+        t5 = time.time()
+        dt3_save += t5 - t4
+        print(f"{datetime.datetime.now()}: Eval W")
+        pipeline.eval_w()
+        t3 = time.time()
+        dt4_eval += t3 - t5
+    print(f"{datetime.datetime.now()}: Save W")
+    pipeline.save_w()
+    t6 = time.time()
+    timings = {
+        "step0_load": t1 - t0,
+        "step1_init": t2 - t1,
+        "step2_train": dt2_train,
+        "step3_save": dt3_save,
+        "step4_eval_w": dt4_eval,
+        "step5_save_w": t6 - t3,
+        "total": t6 - t0}
+    timings["scored"] = timings["total"] - timings["step0_load"]
+    cur_log["timings"] = timings
+    print(
+        "Timings: "
+        + ", ".join(
+            f"{key}: {value:.3f}s"
+            for key, value in timings.items()))
+    with open(config["log_filename"], "w") as f:
+        json.dump(classifim.io.prepare_for_json(cur_log), f)
+    print(f"{datetime.datetime.now()}: Done")

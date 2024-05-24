@@ -1,8 +1,11 @@
+import glob
 import numpy as np
+import os
 import pandas as pd
-from tqdm import tqdm
+import re
 
-from .plot_tools import as_data_frame
+from tqdm import tqdm
+from .plot_tools import as_data_frame, df_to_meshgrid
 
 FIDELITY_DIRECTIONS_2D = {
     "0": np.array([1, 0]),
@@ -206,7 +209,8 @@ def meshgrid_transform_2D_fim(
         fim_df: dataframe with columns lambda0, lambda1, dir, fim
             as produced by compute_2d_fim.
         scaling_resolution: resolution to be used for scaling lambda values.
-            If None, use the number of unique lambda values in fim_df.
+            This is 1/a, where a is the lattice spacing. If None,
+            a heuristic is used.
 
     Note:
         Returned 2D arrays fim_00, fim_01, fim_11 have 2 axes:
@@ -233,14 +237,16 @@ def meshgrid_transform_2D_fim(
     assert np.array_equal(
         actual_dir_keys, np.unique(dir_keys)), (
         f"fim_df['dir'] values are {actual_dir_keys}, expected {dir_keys}")
-    resolution = len(np.unique(fim_df["lambda1"][fim_df["dir"] == "0"]))
+    grid_lambda1s = np.unique(fim_df["lambda1"][fim_df["dir"] == "0"])
+    resolution = len(grid_lambda1s)
     lambda_origin = np.array([
         np.min(fim_df["lambda0"][fim_df["dir"] == "1"]),
         np.min(fim_df["lambda1"][fim_df["dir"] == "0"])])
     if verbose:
         print(f"{resolution=}")
     if scaling_resolution is None:
-        scaling_resolution = resolution
+        scaling_resolution = (len(grid_lambda1s) - 1) / (
+            grid_lambda1s[-1] - grid_lambda1s[0])
     assert fim_df.shape[0] == (resolution - 1) * (4 * resolution - 2), (
         f"{fim_df.shape[0]} != {resolution - 1} * {4 * resolution - 2}.")
     dir_dict_df = dict(iter(fim_df.groupby("dir")))
@@ -294,3 +300,68 @@ def meshgrid_transform_2D_fim(
     res["lambda0"] = lambda_origin[0] + (np.arange(resolution - 1) + 0.5) / scaling_resolution
     return res
 
+def read_ml_fims(
+        fim_dir, filename_pattern, ignore_prefix=None, key_dtype=None):
+    """
+    Read estimated FIMs from the specified directory.
+
+    Args:
+        fim_dir: directory containing the FIM files.
+        filename_pattern: re pattern for the FIM file names to read (excluding
+            '.npz' extension).
+        ignore_prefix: prefix of file names to ignore in key generation.
+        key_dtype: dtype for the keys in the returned dictionaries.
+
+    Returns: pair
+        - ml_fims
+        - ml_fim_mgrids
+    """
+    if isinstance(filename_pattern, str):
+        filename_pattern = re.compile(filename_pattern)
+    if isinstance(ignore_prefix, int):
+        assert ignore_prefix >= 0
+    else:
+        assert ignore_prefix is None or isinstance(ignore_prefix, str)
+    ml_fims = {}
+    ml_fim_mgrids = {}
+    num_lambdas = None
+    for filename in os.listdir(fim_dir):
+        filename_stem, filename_ext = os.path.splitext(filename)
+        if not filename_ext == ".npz":
+            continue
+        if not filename_pattern.match(filename_stem):
+            continue
+        with np.load(os.path.join(fim_dir, filename)) as ml_fim_npz:
+            ml_fim = as_data_frame(
+                ml_fim_npz, skip_scalars=True, decode=True)
+        key = filename_stem
+        if isinstance(ignore_prefix, str):
+            if key.startswith(ignore_prefix):
+                key = key[len(ignore_prefix):]
+        elif isinstance(ignore_prefix, int):
+            key = key[ignore_prefix:]
+        if key_dtype is not None:
+            key = key_dtype(key)
+        ml_fims[key] = ml_fim
+        cur_num_lambdas = None
+        for j in range(5):
+            if f"lambda{j}" not in ml_fim.columns:
+                cur_num_lambdas = j
+                break
+        if cur_num_lambdas not in (1, 2):
+            raise ValueError(
+                f"Unexpected number of lambda columns: {cur_num_lambdas} "
+                "only 1 and 2 dimensional statistical manifolds are "
+                f"supported. File: '{filename}'; columns: {ml_fim.columns}.")
+        if num_lambdas is None:
+            num_lambdas = cur_num_lambdas
+        else:
+            assert num_lambdas == cur_num_lambdas
+        if num_lambdas == 2:
+            ml_fim_mgrids[key] = df_to_meshgrid(
+                ml_fim, x_col='lambda0', y_col='lambda1')
+    if num_lambdas is None:
+        raise ValueError("No files found.")
+    if num_lambdas == 1:
+        return ml_fims
+    return ml_fims, ml_fim_mgrids
