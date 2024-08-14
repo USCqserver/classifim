@@ -205,9 +205,14 @@ def plot_fim_mgrid(
     return zz_max
 
 def plot_fim_mgrid_legend(
-        ax, r2=1, r1=0.9, r0=0.8, x_resolution=1024, y_resolution=1025):
-    xx = np.linspace(-1, 1, x_resolution)
-    yy = np.linspace(-1, 1, y_resolution)
+        ax, r2=1, r1=0.9, r0=0.8, x_resolution=512, y_resolution=512,
+        xlim=(-1, 1), ylim=(-1, 1)):
+    delta_x = xlim[1] - xlim[0]
+    x_resolution = int(0.5 + x_resolution * abs(delta_x))
+    delta_y = ylim[1] - ylim[0]
+    y_resolution = int(0.5 + y_resolution * abs(delta_y))
+    xx = np.linspace(*xlim, x_resolution)
+    yy = np.linspace(*ylim, y_resolution)
     zz = np.zeros((y_resolution, x_resolution, 3))
     r = (xx[np.newaxis, :]**2 + yy[:, np.newaxis]**2)**0.5
     circle_ii = (r1 <= r) & (r < r2)
@@ -222,9 +227,7 @@ def plot_fim_mgrid_legend(
     for i, color_dir in enumerate(color_dirs):
         zz[ball_ii, i] = np.abs(v_vec @ color_dir)[ball_ii]
 
-    # imshow's y axis goes from top to bottom,
-    # the opposite of ours, hence we need to reverse it.
-    ax.imshow(1 - zz[::-1, :, :])
+    ax.imshow(1 - zz, extent=[*xlim, *ylim], origin='lower')
     ax.set_axis_off()
 
 def _plot_fim_df_1d_ml(ax, fixed_lambda_index, fixed_lambda_val, ml_fim_df,
@@ -464,17 +467,37 @@ def plot_fim_df_1d(
             print(f"Saved to '{file_name}'")
     return res
 
-def plot_w2d(ax, npz, sweep_axis=0, colorbar=False, cbar_ax=None):
-    x, y, z = [
-        npz[key]
-        for key in ['lambda_sweep_thresholds', 'lambda_fixed', 'accuracy']]
+def plot_w2d(
+        ax, npz, sweep_axis=0, colorbar=None, cbar_ax=None,
+        vmin=0.75, vmax=1.0, acc_name="accuracy"):
+    """
+    Plot a 2D phase diagram of the W method.
+
+    Args:
+        ax: matplotlib axis to plot on.
+        npz: dict or npz file with keys 'lambda_sweep_thresholds',
+            'lambda_fixed', 'accuracy'. 'lambda_sweep' is also accepted.
+        sweep_axis: 0 or 1, axis along which the sweep is performed.
+        colorbar: whether to plot a colorbar.
+        cbar_ax: axis for the colorbar.
+        vmin, vmax: minimum and maximum values for the color scale.
+        acc_name: alternative name for the accuracy column.
+    """
+    if colorbar is None:
+        colorbar = cbar_ax is not None
+    try:
+        x = npz['lambda_sweep_thresholds']
+    except KeyError:
+        x = npz['lambda_sweep']
+    y = npz['lambda_fixed']
+    z = npz[acc_name]
     if sweep_axis != 0:
         assert sweep_axis == 1
         x, y, z = y, x, z.T
     pc = ax.pcolormesh(
         x, y, z,
         cmap=spiral_background2_cmap,
-        shading='nearest', vmin=0.75, vmax=1.0)
+        shading='nearest', vmin=vmin, vmax=vmax)
     if colorbar:
         fig = ax.get_figure()
         if cbar_ax:
@@ -483,8 +506,11 @@ def plot_w2d(ax, npz, sweep_axis=0, colorbar=False, cbar_ax=None):
             fig.colorbar(pc)
     return pc
 
-def plot_w1d(ax, npz, lambda_v):
-    x = npz['lambda_sweep_thresholds']
+def plot_w1d(ax, npz, lambda_v, **kwargs):
+    try:
+        x = npz['lambda_sweep_thresholds']
+    except KeyError:
+        x = npz['lambda_sweep']
     i = np.searchsorted(npz['lambda_fixed'], lambda_v)
     if i + 1 < len(npz['lambda_fixed']):
         v, vnext = npz['lambda_fixed'][i:i+2]
@@ -492,9 +518,15 @@ def plot_w1d(ax, npz, lambda_v):
             i += 1
     acc = npz['accuracy'][i]
     acc_min = np.min(acc)
-    ax.plot(x, acc)
+    ax.plot(x, acc, **kwargs)
     ax.set_xlim((0, 1))
     ax.set_ylim((max(0.75, acc_min - 0.01), 1))
+
+def ax_sweepline(
+        ax, lambda_fixed, sweep_axis=0, color='black', linewidth=0.5, **kwargs):
+    assert sweep_axis in [0, 1]
+    f = ax.axhline if sweep_axis == 0 else ax.axvline
+    f(lambda_fixed, color=color, linewidth=linewidth, **kwargs)
 
 def plot_pca(ax, pca):
     n0, n1, num_components = pca.shape
@@ -511,13 +543,62 @@ def plot_pca(ax, pca):
     ax.set_ylabel(r"$\lambda_1$")
     ax.set_title("Phase diagram from PCA")
 
-def plot_gt_peaks_2d(ax, sweep_lambda_index, gt_peaks):
+def _get_kwargs(*args):
+    kwargs = {}
+    for arg in args:
+        if arg is not None:
+            kwargs.update(**arg)
+    return kwargs
+
+def plot_gt_peaks_2d(
+        ax, sweep_lambda_index, gt_peaks, style=None,
+        style_inner=None, style_outer=None):
     assert sweep_lambda_index in [0, 1]
     xs = gt_peaks["lambda_sweep"]
     ys = gt_peaks["lambda_fixed"]
     if sweep_lambda_index == 1:
         xs, ys = ys, xs
-    for is_inner in [True, False]:
-        ii = (gt_peaks["is_inner"] == is_inner)
-        ax.plot(
-            xs[ii], ys[ii], ('o' if is_inner else 's'), mfc='none', mec='black')
+    ii = (gt_peaks["is_inner"] == True)
+    ax.plot(
+        xs[ii], ys[ii], **_get_kwargs(
+            dict(
+                linestyle='None', marker='o', mfc='none', mec='black',
+                label="GT inner"),
+            style, style_inner))
+    ax.plot(
+        xs[~ii], ys[~ii], **_get_kwargs(
+            dict(
+                linestyle='None', marker='s', mfc='none', mec='green',
+                label="GT outer"),
+            style, style_outer))
+
+def plot_predicted_peaks_2d(ax, sweep_lambda_index, predicted_peaks, **kwargs):
+    assert sweep_lambda_index in [0, 1]
+    xs = predicted_peaks["lambda_sweep"]
+    ys = predicted_peaks["lambda_fixed"]
+    if sweep_lambda_index == 1:
+        xs, ys = ys, xs
+    plot_kwargs = {
+        'linestyle': 'None', 'marker': 'v', 'mfc': (1, 1, 1, 0.5),
+        'mec': (0.3, 0.3, 0.3), 'label': "Predicted"}
+    plot_kwargs.update(kwargs)
+    ax.plot(xs, ys, **plot_kwargs)
+
+def max_of_second_highest_slow(z: np.ndarray) -> float:
+    # Check if the input is a 2D array
+    if z.ndim != 2:
+        raise ValueError("Input must be a 2D array")
+
+    second_highest_values = []
+    for row in z:
+        unique_row = np.unique(row)  # Get unique elements in the row
+        if len(unique_row) < 2:
+            raise ValueError("Each row must have at least two unique elements")
+        sorted_row = np.sort(unique_row)  # Sort the row
+        second_highest = sorted_row[-2]  # Get the second highest value
+        second_highest_values.append(second_highest)
+    return max(second_highest_values)  # Return the maximum of the second highest values
+
+def max_of_second_highest_fast(z: np.ndarray) -> float:
+    assert z.ndim == 2, "Input must be a 2D array"
+    return np.max(np.partition(z, -2, axis=1)[:, -2])

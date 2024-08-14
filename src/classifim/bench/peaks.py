@@ -193,7 +193,7 @@ def get_gt_peaks(
 
 def get_w_peaks(
         lambda_fixed, lambda_sweep, w_accuracy, num_peaks, postprocess=False,
-        lambda_fixed_expected=None, xrange=None):
+        lambda_fixed_expected=None, xrange=None, return_pp=False):
     """
     Extract peaks from van Nieuwenburg's W.
 
@@ -207,26 +207,34 @@ def get_w_peaks(
             of the output are matching the expected values.
         xrange: Used to blindly guess peaks if W predicts less peaks than
             needed.
+        return_pp: whether to return the postprocessed w_accuracy.
     """
     assert w_accuracy.shape == (len(lambda_fixed), len(lambda_sweep))
     assert num_peaks.shape == (len(lambda_fixed),)
+    res = {}
     if postprocess:
         w_accuracy = w_smoothing(
             lambda_sweep, w_accuracy, axis=1, extra_padding=1)
     else:
+        assert not return_pp
         w_accuracy = np.pad(
             w_accuracy, [(0, 0), (1, 1)], mode='constant', constant_values=1.0)
     x = lambda_sweep
     x = np.concatenate([[2 * x[0] - x[1]], x, [2 * x[-1] - x[-2]]])
+    if return_pp:
+        res["pp"] = {
+            "accuracy": w_accuracy,
+            "lambda_sweep": x,
+            "lambda_fixed": lambda_fixed}
     (peak_ifixed,), peak_x = find_peaks_v(
         x, w_accuracy, num_peaks, axis=1, xrange=xrange)
     res_lambda_fixed = lambda_fixed[peak_ifixed]
     if lambda_fixed_expected is not None:
         assert np.array_equal(res_lambda_fixed, lambda_fixed_expected)
-    return {
-        "lambda_fixed_ii": peak_ifixed,
-        "lambda_fixed": res_lambda_fixed,
-        "lambda_sweep": peak_x}
+    res["lambda_fixed_ii"] = peak_ifixed
+    res["lambda_fixed"] = res_lambda_fixed
+    res["lambda_sweep"] = peak_x
+    return res
 
 def get_pca_peak(x, num_peaks):
     """
@@ -512,7 +520,7 @@ def smoothen_classifim_1d(x, y, axis, kernel0_size=5, kernel0_sigma=1.0, cut=1):
 
 def get_classifim_peaks(
         ml_mg, num_peaks, postprocess=False, lambda_fixed_expected=None,
-        lambda_fixed_tolerance=None, xrange=None):
+        lambda_fixed_tolerance=None, xrange=None, return_pp=False):
     """
     Extract peaks from ClassiFIM predictions.
 
@@ -526,13 +534,21 @@ def get_classifim_peaks(
         lambda_fixed_tolerance: if not None, adjust lambda_fixed values
             by at most this value to match lambda_fixed_expected.
         xrange: Interval for peaks, used if guessing is needed.
+        return_pp: whether to return the postprocessed fim.
     """
     x = ml_mg["lambda_sweep"]
     fim = ml_mg["fim"]
     assert fim.shape == (len(ml_mg["lambda_fixed"]), len(x))
     assert num_peaks.shape == (len(ml_mg["lambda_fixed"]),)
+    res = {}
     if postprocess:
         x, fim = smoothen_classifim_1d(x, fim, axis=1)
+        res["pp"] = {
+            "lambda_sweep": x,
+            "lambda_fixed": ml_mg["lambda_fixed"],
+            "fim": fim}
+    else:
+        assert not return_pp
     (peak_ifixed,), peak_x = find_peaks_v(x, fim, num_peaks, axis=1, xrange=xrange)
     res_lambda_fixed = ml_mg["lambda_fixed"][peak_ifixed]
     if lambda_fixed_expected is not None:
@@ -542,10 +558,10 @@ def get_classifim_peaks(
                 atol=lambda_fixed_tolerance)
             res_lambda_fixed = lambda_fixed_expected
         np.testing.assert_array_equal(res_lambda_fixed, lambda_fixed_expected)
-    return {
-        "lambda_fixed_ii": peak_ifixed,
-        "lambda_fixed": res_lambda_fixed,
-        "lambda_sweep": peak_x}
+    res["lambda_fixed_ii"] = peak_ifixed
+    res["lambda_fixed"] = res_lambda_fixed
+    res["lambda_sweep"] = peak_x
+    return res
 
 def set_error(
         group, x_gt, x_pred, x_gt_ii=None, xmin=None, xmax=None, verbosity=1):
@@ -656,7 +672,9 @@ def compute_peak_rmses(gt_peaks, model_peaks_dict, verbosity=1):
             verbosity=verbosity)**0.5
     return res
 
-def paired_t_tests(df, verbose=False, metric_name="smooth_peaks", key_name="seed"):
+def paired_t_tests(
+        df, verbose=False, metric_name="smooth_peaks", key_name="seed",
+        pval_format=".3f"):
     grouped = df.groupby("method_name")
 
     method_dfs = {}
@@ -683,7 +701,7 @@ def paired_t_tests(df, verbose=False, metric_name="smooth_peaks", key_name="seed
             print(
                 f"{method1} vs {method2}: "
                 f"{v1:.3f} {sign} {v2:.3f} "
-                f"(t-stat={t_stat:.3f}, p={p_val:.3f})")
+                f"(t-stat={t_stat:.3f}, p={p_val:{pval_format}})")
     return results
 
 DEFAULT_PEAK_ERROR_METRICS = {
